@@ -457,7 +457,17 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
 
             x_cur = self.input_encoder(agent_inputs[:, last_episode, :prefix_len, :])
             h_cur = self.model(inputs_embeds=x_cur, use_cache=False, return_dict=True).last_hidden_state
-            z_task = (prev_sum[:, None, :] + h_cur) / float(used + 1)
+
+            # 1. Unbiased full mean approximation of previous episodes
+            if used > 0:
+                prev_mean = prev_sum / float(used)
+                z_task = (float(last_episode) * prev_mean[:, None, :] + h_cur) / float(last_episode + 1)
+            else:
+                z_task = h_cur
+
+            # 2. Normal mean
+            # z_task = (prev_sum[:, None, :] + h_cur) / float(used + 1)
+            
             obs_prefix = current_obs[:, last_episode, :prefix_len, :]
             policy_out, value = self._heads(z_task, obs_prefix)
             if not return_dict:

@@ -89,7 +89,7 @@ def get_args():
     parser.add_argument("--lr_end_factor", type=float, default=0.05)
 
     parser.add_argument("--eval_interval", type=int, default=10, help="Evaluate every N updates.")
-    parser.add_argument("--eval_num_tasks", type=int, default=20, help="Sample this many eval variations, not all variations.")
+    parser.add_argument("--eval_num_tasks", type=int, default=25, help="Sample this many eval variations, not all variations.")
     parser.add_argument("--eval_num_trials", type=int, default=1, help="Number of trials to evaluate per task.")
     parser.add_argument("--comment", type=str, default="")
 

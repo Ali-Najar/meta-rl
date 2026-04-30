@@ -11,6 +11,7 @@ import metaworld
 import numpy as np
 import torch
 import torch.optim as optim
+import warnings
 
 from ttt import TTTConfig
 from agent import TTTEpisodePolicy
@@ -233,6 +234,16 @@ def train():
 
     if args.task_set not in ["ML1", "ML10", "ML45"]:
         raise ValueError("This refactored trainer is for ML1/ML10/ML45.")
+    
+    if args.ppo_context_episode_sample > 0 and args.ppo_sequential_loss_scope == "prefix":
+        warnings.warn(
+            "--ppo_sequential_loss_scope=prefix with "
+            "--ppo_context_episode_sample > 0 only computes prefix loss over the "
+            "current episode prefix, while sampled previous episodes are used as "
+            "context only. This is not equivalent to full-trial prefix loss. "
+            "Use --ppo_sequential_loss_scope=chunk for the cleaner sampled-context setting.",
+            UserWarning,
+        )
 
     meta_learning = build_metaworld(args)
 
