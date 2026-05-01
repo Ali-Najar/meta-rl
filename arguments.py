@@ -88,7 +88,7 @@ def get_args():
     parser.add_argument("--lr_decay_start", type=float, default=0.0)
     parser.add_argument("--lr_end_factor", type=float, default=0.05)
 
-    parser.add_argument("--eval_interval", type=int, default=10, help="Evaluate every N updates.")
+    parser.add_argument("--eval_interval", type=int, default=5, help="Evaluate every N updates.")
     parser.add_argument("--eval_num_tasks", type=int, default=25, help="Sample this many eval variations, not all variations.")
     parser.add_argument("--eval_num_trials", type=int, default=1, help="Number of trials to evaluate per task.")
     parser.add_argument("--comment", type=str, default="")
@@ -126,6 +126,17 @@ def get_args():
             "For sequential PPO with aggregator_type=mean only: if >0, sample this many previous "
             "episodes as context plus the current episode, instead of forwarding all previous episodes. "
             "Use 0 to use all previous episodes."
+        ),
+    )
+
+    parser.add_argument(
+        "--detach_context_episodes",
+        action="store_true",
+        help=(
+            "For sequential PPO with aggregator_type=mean: encode previous episode final "
+            "embeddings once with no_grad/detach for each env minibatch and reuse them "
+            "across current-episode chunks. This saves PPO compute but uses stale, "
+            "stop-gradient previous-episode context. Rollout is unchanged."
         ),
     )
 

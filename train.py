@@ -245,6 +245,27 @@ def train():
             UserWarning,
         )
 
+    if args.detach_context_episodes:
+        if args.ppo_update_mode != "sequential":
+            warnings.warn(
+                "--detach_context_episodes only affects --ppo_update_mode=sequential. "
+                "It will be ignored in random PPO mode.",
+                UserWarning,
+            )
+        if args.aggregator_type != "mean":
+            warnings.warn(
+                "--detach_context_episodes is only implemented for --aggregator_type=mean. "
+                "It will be ignored for the slot-specific concat/linear aggregator.",
+                UserWarning,
+            )
+        if args.ppo_sequential_loss_scope == "prefix":
+            warnings.warn(
+                "--detach_context_episodes with --ppo_sequential_loss_scope=prefix computes "
+                "prefix loss only over the current episode prefix. Previous episodes are reused "
+                "as detached context features, not trained directly in that minibatch.",
+                UserWarning,
+            )
+
     meta_learning = build_metaworld(args)
 
     envs = gym.vector.SyncVectorEnv(

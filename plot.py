@@ -8,13 +8,13 @@ from cycler import cycler
 ROOT = Path("csv_outputs")
 
 # Set to 1 or None to disable moving average
-MOVING_AVERAGE_WINDOW = 5
+MOVING_AVERAGE_WINDOW = 1
 
 METRICS = [
     ("rollout_anysuccess", "Rollout Any Success"),
     ("rollout_trial_return", "Rollout Trial Return"),
     ("eval_final_return", "Eval Final Return"),
-    ("eval_final_success", "Eval Final Success"),
+    ("eval_anysuccess", "Eval Any Success"),
 ]
 
 # Colorblind-friendly Okabe-Ito palette

@@ -1,4 +1,5 @@
 import numpy as np
+import warnings
 import torch
 import torch.nn as nn
 import gymnasium as gym
@@ -433,11 +434,17 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
     mb_steps = min(mb_steps, ep_len)
     loss_scope = getattr(args, "ppo_sequential_loss_scope", "chunk")
     context_sample = getattr(args, "ppo_context_episode_sample", 0)
+    detach_context = getattr(args, "detach_context_episodes", False)
 
     if context_sample and getattr(model, "aggregator_type", None) != "mean":
         raise ValueError("--ppo_context_episode_sample requires --aggregator_type mean")
     if context_sample and loss_scope != "chunk":
-        raise ValueError("--ppo_context_episode_sample currently supports --ppo_sequential_loss_scope chunk only")
+        warnings.warn(
+            "--ppo_context_episode_sample with --ppo_sequential_loss_scope=prefix "
+            "returns only the current episode prefix. Previous sampled episodes "
+            "are used as context only, not as loss positions.",
+            UserWarning,
+        )
 
     total_policy_loss = 0.0
     total_value_loss = 0.0
@@ -450,41 +457,84 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
         env_perm = torch.randperm(num_envs, device=device)
         for start_idx in range(0, num_envs, mb_envs):
             env_idx = env_perm[start_idx : start_idx + mb_envs]
+            use_detached_context = (
+                detach_context
+                and getattr(model, "aggregator_type", None) == "mean"
+                and getattr(args, "ppo_update_mode", "random") == "sequential"
+            )
+            context_finals = None
+            if use_detached_context:
+                context_finals = model.encode_episode_finals_detached(b_inputs[env_idx])
             for ep_idx in range(num_eps):
                 for step_start in range(0, ep_len, mb_steps):
                     step_end = min(step_start + mb_steps, ep_len)
 
                     context_indices = _sample_previous_episodes(ep_idx, context_sample, device)
-                    outputs = model.forward_prefix_flat(
-                        b_inputs[env_idx],
-                        b_states[env_idx],
-                        last_episode=ep_idx,
-                        last_step=step_end - 1,
-                        context_episode_indices=context_indices,
-                        return_dict=True,
-                    )
-                    mean, log_std = outputs.policy
-                    values = outputs.value
 
-                    if context_indices is None:
-                        actions_seq = _concat_episode_prefix(b_actions, env_idx, ep_idx, step_end)
-                        old_seq = _concat_episode_prefix(b_old_log_probs[..., None], env_idx, ep_idx, step_end).squeeze(-1)
-                        adv_seq = _concat_episode_prefix(b_adv[..., None], env_idx, ep_idx, step_end).squeeze(-1)
-                        returns_seq = _concat_episode_prefix(b_returns[..., None], env_idx, ep_idx, step_end).squeeze(-1)
+                    if use_detached_context:
+                        # Fast stop-gradient context mode: previous episodes were
+                        # encoded once into context_finals and are reused here.
+                        # Only the current episode prefix is forwarded with grad.
+                        outputs = model.forward_current_prefix_with_context(
+                            b_inputs[env_idx],
+                            b_states[env_idx],
+                            episode_idx=ep_idx,
+                            last_step=step_end - 1,
+                            context_finals=context_finals,
+                            context_episode_indices=context_indices,
+                            return_dict=True,
+                        )
+                        mean, log_std = outputs.policy
+                        values = outputs.value
 
-                        if loss_scope == "chunk":
-                            pos = torch.arange(ep_idx * ep_len + step_start, ep_idx * ep_len + step_end, device=device)
-                        elif loss_scope == "prefix":
-                            pos = None
-                        else:
-                            raise ValueError("ppo_sequential_loss_scope must be 'chunk' or 'prefix'")
-                    else:
-                        # Sampled-context mode returns only current episode prefix.
                         actions_seq = b_actions[env_idx, ep_idx, :step_end]
                         old_seq = b_old_log_probs[env_idx, ep_idx, :step_end]
                         adv_seq = b_adv[env_idx, ep_idx, :step_end]
                         returns_seq = b_returns[env_idx, ep_idx, :step_end]
-                        pos = torch.arange(step_start, step_end, device=device)
+                        if loss_scope == "chunk":
+                            pos = torch.arange(step_start, step_end, device=device)
+                        elif loss_scope == "prefix":
+                            # Prefix means current-episode prefix only in detached
+                            # context mode. Previous episodes are context only.
+                            pos = None
+                        else:
+                            raise ValueError("ppo_sequential_loss_scope must be 'chunk' or 'prefix'")
+                    else:
+                        outputs = model.forward_prefix_flat(
+                            b_inputs[env_idx],
+                            b_states[env_idx],
+                            last_episode=ep_idx,
+                            last_step=step_end - 1,
+                            context_episode_indices=context_indices,
+                            return_dict=True,
+                        )
+                        mean, log_std = outputs.policy
+                        values = outputs.value
+
+                        if context_indices is None:
+                            actions_seq = _concat_episode_prefix(b_actions, env_idx, ep_idx, step_end)
+                            old_seq = _concat_episode_prefix(b_old_log_probs[..., None], env_idx, ep_idx, step_end).squeeze(-1)
+                            adv_seq = _concat_episode_prefix(b_adv[..., None], env_idx, ep_idx, step_end).squeeze(-1)
+                            returns_seq = _concat_episode_prefix(b_returns[..., None], env_idx, ep_idx, step_end).squeeze(-1)
+
+                            if loss_scope == "chunk":
+                                pos = torch.arange(ep_idx * ep_len + step_start, ep_idx * ep_len + step_end, device=device)
+                            elif loss_scope == "prefix":
+                                pos = None
+                            else:
+                                raise ValueError("ppo_sequential_loss_scope must be 'chunk' or 'prefix'")
+                        else:
+                            # Sampled-context mode returns only current episode prefix.
+                            actions_seq = b_actions[env_idx, ep_idx, :step_end]
+                            old_seq = b_old_log_probs[env_idx, ep_idx, :step_end]
+                            adv_seq = b_adv[env_idx, ep_idx, :step_end]
+                            returns_seq = b_returns[env_idx, ep_idx, :step_end]
+                            if loss_scope == "chunk":
+                                pos = torch.arange(step_start, step_end, device=device)
+                            elif loss_scope == "prefix":
+                                pos = None
+                            else:
+                                raise ValueError("ppo_sequential_loss_scope must be 'chunk' or 'prefix'")
 
                     loss, p_loss, v_loss, ent, last_norm = _ppo_step_from_sequences(
                         model,

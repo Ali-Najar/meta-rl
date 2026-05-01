@@ -399,6 +399,90 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         return RLModelOutput(policy=policy_out, value=value, hidden_states=episode_hidden, cache_params=None)
 
 
+    @torch.no_grad()
+    def encode_episode_finals_detached(self, agent_inputs: torch.Tensor) -> torch.Tensor:
+        """Encode each full episode once and return detached final embeddings.
+
+        Args:
+            agent_inputs: (B, E, T, input_dim)
+
+        Returns:
+            finals: (B, E, H), where finals[:, e] is the final TTT hidden
+            state of episode e. This is intended as stop-gradient context for
+            efficient sequential PPO; rollout behavior is unchanged.
+        """
+        if agent_inputs.ndim != 4:
+            raise ValueError(f"agent_inputs must be (B,E,T,D), got {agent_inputs.shape}")
+        B, E, T, D = agent_inputs.shape
+        H = self.hidden_size
+        x = self.input_encoder(agent_inputs.reshape(B * E, T, D))
+        h = self.model(inputs_embeds=x, use_cache=False, return_dict=True).last_hidden_state
+        finals = h[:, -1, :].reshape(B, E, H)
+        return finals.detach()
+
+    def forward_current_prefix_with_context(
+        self,
+        agent_inputs: torch.Tensor,
+        current_obs: torch.Tensor,
+        episode_idx: int,
+        last_step: int,
+        context_finals: torch.Tensor,
+        context_episode_indices=None,
+        return_dict: bool = True,
+    ):
+        """Forward only current episode prefix using detached previous context.
+
+        This is the fast stop-gradient context path for sequential PPO. It is
+        only defined for aggregator_type='mean'. Previous episodes are supplied
+        as already-computed detached final embeddings; gradients flow through
+        the current episode prefix and heads, but not through previous episodes.
+
+        Returns policy/value for current episode positions 0..last_step only.
+        """
+        if self.aggregator_type != "mean":
+            raise ValueError("Detached context reuse is only valid with aggregator_type='mean'")
+        if agent_inputs.ndim != 4:
+            raise ValueError(f"agent_inputs must be (B,E,T,D), got {agent_inputs.shape}")
+        B, E, T, D = agent_inputs.shape
+        if episode_idx < 0 or episode_idx >= E:
+            raise ValueError(f"episode_idx={episode_idx} is out of range for E={E}")
+        if last_step < 0 or last_step >= T:
+            raise ValueError(f"last_step={last_step} is out of range for T={T}")
+        if context_finals.shape[:2] != (B, E):
+            raise ValueError(
+                f"context_finals must have shape (B,E,H) matching ({B},{E},H), "
+                f"got {context_finals.shape}"
+            )
+
+        prefix_len = last_step + 1
+        x_cur = self.input_encoder(agent_inputs[:, episode_idx, :prefix_len, :])
+        h_cur = self.model(inputs_embeds=x_cur, use_cache=False, return_dict=True).last_hidden_state
+
+        if episode_idx <= 0:
+            z_task = h_cur
+        else:
+            if context_episode_indices is None:
+                prev_sum = context_finals[:, :episode_idx, :].sum(dim=1)
+                z_task = (prev_sum[:, None, :] + h_cur) / float(episode_idx + 1)
+            else:
+                used = len(context_episode_indices)
+                if used == 0:
+                    z_task = h_cur
+                else:
+                    for ep in context_episode_indices:
+                        if ep < 0 or ep >= episode_idx:
+                            raise ValueError(f"context episode {ep} must be in [0, {episode_idx})")
+                    prev_sum = context_finals[:, context_episode_indices, :].sum(dim=1)
+                    prev_mean = prev_sum / float(used)
+                    z_task = (float(episode_idx) * prev_mean[:, None, :] + h_cur) / float(episode_idx + 1)
+
+        obs_prefix = current_obs[:, episode_idx, :prefix_len, :]
+        policy_out, value = self._heads(z_task, obs_prefix)
+        if not return_dict:
+            return policy_out, value, h_cur
+        return RLModelOutput(policy=policy_out, value=value, hidden_states=h_cur, cache_params=None)
+
+
     def forward_prefix_flat(
         self,
         agent_inputs: torch.Tensor,
