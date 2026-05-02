@@ -313,11 +313,30 @@ def _concat_episode_prefix(x, env_idx, ep_idx, step_end):
     return torch.cat(parts, dim=1)
 
 
-def _sample_previous_episodes(ep_idx, sample_count, device):
+def _sample_previous_episodes(ep_idx, sample_count, device, mode="uniform"):
+    """Sample previous episode indices and return them in chronological order.
+
+    mode:
+      uniform: sample K uniformly from [0, ep_idx).
+      recent: sample K without replacement with probability increasing for newer episodes.
+      last:    take the most recent K previous episodes.
+    """
     if sample_count is None or sample_count <= 0 or ep_idx <= 0:
         return None
     k = min(sample_count, ep_idx)
-    sampled = torch.randperm(ep_idx, device=device)[:k].sort().values
+    mode = str(mode or "uniform")
+
+    if mode == "last":
+        sampled = torch.arange(ep_idx - k, ep_idx, device=device)
+    elif mode == "uniform":
+        sampled = torch.randperm(ep_idx, device=device)[:k].sort().values
+    elif mode == "recent":
+        # Linearly increasing weights: episode ep_idx-1 is most likely.
+        weights = torch.arange(1, ep_idx + 1, device=device, dtype=torch.float32)
+        sampled = torch.multinomial(weights, num_samples=k, replacement=False).sort().values
+    else:
+        raise ValueError("context_episode_sample_mode must be one of: uniform, recent, last")
+
     return [int(x.item()) for x in sampled]
 
 
@@ -414,7 +433,7 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
 
     ppo_context_episode_sample:
       >0 samples that many previous episodes as context plus the current episode.
-      This is only supported with aggregator_type='mean' and loss_scope='chunk'.
+      This is supported with aggregator_type='mean' or 'ema' and loss_scope='chunk'.
     """
     if len(rollouts) == 7:
         b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns, b_valid = rollouts
@@ -436,8 +455,8 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
     context_sample = getattr(args, "ppo_context_episode_sample", 0)
     detach_context = getattr(args, "detach_context_episodes", False)
 
-    if context_sample and getattr(model, "aggregator_type", None) != "mean":
-        raise ValueError("--ppo_context_episode_sample requires --aggregator_type mean")
+    if context_sample and getattr(model, "aggregator_type", None) not in ["mean", "ema"]:
+        raise ValueError("--ppo_context_episode_sample requires --aggregator_type mean or ema")
     if context_sample and loss_scope != "chunk":
         warnings.warn(
             "--ppo_context_episode_sample with --ppo_sequential_loss_scope=prefix "
@@ -459,7 +478,7 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
             env_idx = env_perm[start_idx : start_idx + mb_envs]
             use_detached_context = (
                 detach_context
-                and getattr(model, "aggregator_type", None) == "mean"
+                and getattr(model, "aggregator_type", None) in ["mean", "ema"]
                 and getattr(args, "ppo_update_mode", "random") == "sequential"
             )
             context_finals = None
@@ -469,7 +488,12 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
                 for step_start in range(0, ep_len, mb_steps):
                     step_end = min(step_start + mb_steps, ep_len)
 
-                    context_indices = _sample_previous_episodes(ep_idx, context_sample, device)
+                    context_indices = _sample_previous_episodes(
+                        ep_idx,
+                        context_sample,
+                        device,
+                        mode=getattr(args, "context_episode_sample_mode", "uniform"),
+                    )
 
                     if use_detached_context:
                         # Fast stop-gradient context mode: previous episodes were

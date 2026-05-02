@@ -68,6 +68,18 @@ def get_args():
             "episode embedding."
         ),
     )
+    parser.add_argument(
+        "--context_episode_sample_mode",
+        type=str,
+        default="uniform",
+        choices=["uniform", "recent", "last"],
+        help=(
+            "How to choose previous episodes when --ppo_context_episode_sample > 0. "
+            "uniform = random previous episodes; recent = sample previous episodes with "
+            "higher probability for newer episodes; last = use the most recent K previous episodes. "
+            "Sampled episode indices are sorted chronologically before aggregation."
+        ),
+    )
 
     # Ablation knobs for the ECET-style additions.
     parser.add_argument(
@@ -86,8 +98,21 @@ def get_args():
         "--aggregator_type",
         type=str,
         default="mean",
-        choices=["concat", "mean"],
-        help="concat = current slot-specific linear aggregator; mean = average previous episode finals plus current TTT output.",
+        choices=["concat", "mean", "ema"],
+        help=(
+            "concat = current slot-specific linear aggregator; "
+            "mean = average previous episode finals plus current TTT output; "
+            "ema = recency-weighted exponential moving average over previous episode finals."
+        ),
+    )
+    parser.add_argument(
+        "--ema_beta",
+        type=float,
+        default=0.7,
+        help=(
+            "EMA decay for --aggregator_type ema. Higher values keep longer memory; "
+            "lower values weight newer episodes/current hidden more strongly."
+        ),
     )
     parser.add_argument(
         "--no_state_proj",
@@ -131,7 +156,7 @@ def get_args():
         default=None,
         help=(
             "Number of episodes to run per evaluation trial. If omitted, uses --trial_length. "
-            "This can be larger than training trial_length when aggregator_type=mean."
+            "This can be larger than training trial_length when aggregator_type=mean or ema."
         ),
     )
     parser.add_argument(
@@ -175,7 +200,7 @@ def get_args():
         type=int,
         default=0,
         help=(
-            "For sequential PPO with aggregator_type=mean only: if >0, sample this many previous "
+            "For sequential PPO with aggregator_type=mean/ema only: if >0, sample this many previous "
             "episodes as context plus the current episode, instead of forwarding all previous episodes. "
             "Use 0 to use all previous episodes."
         ),
@@ -185,7 +210,7 @@ def get_args():
         "--detach_context_episodes",
         action="store_true",
         help=(
-            "For sequential PPO with aggregator_type=mean: encode previous episode final "
+            "For sequential PPO with aggregator_type=mean/ema: encode previous episode final "
             "embeddings once with no_grad/detach for each env minibatch and reuse them "
             "across current-episode chunks. This saves PPO compute but uses stale, "
             "stop-gradient previous-episode context. Rollout is unchanged."
@@ -218,6 +243,9 @@ def get_args():
 
     if args.context_seq_len is None:
         args.context_seq_len = 0
+
+    if not (0.0 <= args.ema_beta <= 1.0):
+        raise ValueError("--ema_beta must be between 0 and 1 inclusive.")
     if args.context_seq_len < 0:
         raise ValueError("--context_seq_len must be >= 0. Use 0 for full-episode context.")
 

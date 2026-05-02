@@ -115,7 +115,7 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
     if model.aggregator_type == "concat" and eval_trial_length != model.num_episodes:
         raise ValueError(
             "Evaluation trial length different from training trial_length is only "
-            "supported with aggregator_type='mean'. The concat/slot aggregator has "
+            "supported with aggregator_type='mean' or 'ema'. The concat/slot aggregator has "
             "a fixed number of learned episode slots."
         )
 
@@ -291,7 +291,7 @@ def train():
     if args.aggregator_type == "concat" and args.eval_trial_length != args.trial_length:
         warnings.warn(
             "--eval_trial_length different from --trial_length is only supported with "
-            "--aggregator_type=mean. The concat/slot aggregator has a fixed number "
+            "--aggregator_type=mean or ema. The concat/slot aggregator has a fixed number "
             "of learned episode slots and will error if evaluated with a different length.",
             UserWarning,
         )
@@ -305,6 +305,20 @@ def train():
             "Use --ppo_sequential_loss_scope=chunk for the cleaner sampled-context setting.",
             UserWarning,
         )
+
+    if args.ppo_context_episode_sample > 0:
+        if args.aggregator_type not in ["mean", "ema"]:
+            warnings.warn(
+                "--ppo_context_episode_sample is only supported by --aggregator_type=mean/ema. "
+                "The PPO update will raise an error for concat.",
+                UserWarning,
+            )
+        if args.aggregator_type == "ema" and args.context_episode_sample_mode == "uniform":
+            warnings.warn(
+                "For --aggregator_type=ema, --context_episode_sample_mode=uniform is valid but noisy. "
+                "recent or last usually matches recency-weighted EMA better.",
+                UserWarning,
+            )
 
     if args.context_seq_len > 0:
         if args.ppo_update_mode != "sequential":
@@ -358,9 +372,9 @@ def train():
                 "It will be ignored in random PPO mode.",
                 UserWarning,
             )
-        if args.aggregator_type != "mean":
+        if args.aggregator_type not in ["mean", "ema"]:
             warnings.warn(
-                "--detach_context_episodes is only implemented for --aggregator_type=mean. "
+                "--detach_context_episodes is only implemented for --aggregator_type=mean/ema. "
                 "It will be ignored for the slot-specific concat/linear aggregator.",
                 UserWarning,
             )
@@ -418,6 +432,7 @@ def train():
         policy_hidden_sizes=args.policy_hidden_sizes,
         value_hidden_sizes=args.value_hidden_sizes,
         aggregator_type=args.aggregator_type,
+        ema_beta=args.ema_beta,
         use_state_proj=args.use_state_proj,
         init_type=args.init_type,
         context_seq_len=args.context_seq_len,

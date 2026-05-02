@@ -151,6 +151,7 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
       value_hidden_sizes=(): linear value head like the old code.
       aggregator_type="concat": current ECET-style slot-specific linear aggregator.
       aggregator_type="mean": average previous episode finals + current TTT output.
+      aggregator_type="ema": recency-weighted EMA over previous episode finals + current TTT output.
       use_state_proj=False: head sees only TTT/aggregated hidden, like old code.
       init_type="ppo": PPO-style orthogonal head initialization.
       init_type="xavier": current Xavier MLP initialization.
@@ -167,6 +168,7 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         policy_hidden_sizes=(64, 64),
         value_hidden_sizes=(64, 64),
         aggregator_type: str = "concat",
+        ema_beta: float = 0.7,
         use_state_proj: bool = True,
         init_type: str = "xavier",
         context_seq_len: int = 0,
@@ -184,6 +186,7 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         self.num_episodes = num_episodes
         self.continuous = continuous
         self.aggregator_type = aggregator_type
+        self.ema_beta = float(ema_beta)
         self.use_state_proj = use_state_proj
         self.init_type = init_type
         self.context_seq_len = int(context_seq_len or 0)
@@ -195,15 +198,17 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         if self.prev_context_window_mode not in ["last", "random"]:
             raise ValueError("prev_context_window_mode must be either 'last' or 'random'")
 
-        if self.aggregator_type not in ["concat", "mean"]:
-            raise ValueError("aggregator_type must be either 'concat' or 'mean'")
+        if self.aggregator_type not in ["concat", "mean", "ema"]:
+            raise ValueError("aggregator_type must be one of 'concat', 'mean', or 'ema'")
+        if not (0.0 <= self.ema_beta <= 1.0):
+            raise ValueError("ema_beta must be between 0 and 1")
         if self.init_type not in ["xavier", "ppo"]:
             raise ValueError("init_type must be either 'xavier' or 'ppo'")
 
         self.input_encoder = nn.Linear(input_dim, self.hidden_size)
 
         # Current ECET-style aggregator: flatten episode slots and learn a
-        # slot-specific linear map. Not used when aggregator_type='mean'.
+        # slot-specific linear map. Not used when aggregator_type is mean/ema.
         if self.aggregator_type == "concat":
             self.episode_aggregator = nn.Linear(num_episodes * self.hidden_size, self.hidden_size)
         else:
@@ -327,9 +332,55 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
 
         return torch.stack(outputs, dim=1)
 
+    def _ema_update(self, memory: torch.Tensor, new_value: torch.Tensor) -> torch.Tensor:
+        """One EMA update over episode-level embeddings."""
+        return self.ema_beta * memory + (1.0 - self.ema_beta) * new_value
+
+    def _ema_from_finals(self, finals: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return EMA over finals in chronological order.
+
+        finals: (B, K, H). If K=0, returns None.
+        """
+        if finals.shape[1] == 0:
+            return None
+        memory = finals[:, 0, :]
+        for idx in range(1, finals.shape[1]):
+            memory = self._ema_update(memory, finals[:, idx, :])
+        return memory
+
+    def aggregate_full_trial_ema(self, episode_hidden: torch.Tensor) -> torch.Tensor:
+        """EMA previous episode finals plus current TTT output.
+
+        For episode k and timestep t, z is current_hidden for k=0. For k>0,
+        previous_memory is the EMA of final_hidden(episodes < k), and
+        z = beta * previous_memory + (1-beta) * current_hidden(k,t).
+        """
+        B, E, T, H = episode_hidden.shape
+        outputs = []
+        final_embeddings = episode_hidden[:, :, -1, :]
+        prev_memory = None
+
+        for ep_idx in range(E):
+            current_seq = episode_hidden[:, ep_idx, :, :]
+            if prev_memory is None:
+                z = current_seq
+            else:
+                z = self.ema_beta * prev_memory[:, None, :] + (1.0 - self.ema_beta) * current_seq
+            outputs.append(z)
+
+            current_final = final_embeddings[:, ep_idx, :]
+            if prev_memory is None:
+                prev_memory = current_final
+            else:
+                prev_memory = self._ema_update(prev_memory, current_final)
+
+        return torch.stack(outputs, dim=1)
+
     def aggregate_full_trial(self, episode_hidden: torch.Tensor) -> torch.Tensor:
         if self.aggregator_type == "concat":
             return self.aggregate_full_trial_concat(episode_hidden)
+        if self.aggregator_type == "ema":
+            return self.aggregate_full_trial_ema(episode_hidden)
         return self.aggregate_full_trial_mean(episode_hidden)
 
     def aggregate_step_concat(
@@ -361,6 +412,17 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
             return (prev_sum + current_hidden) / float(episode_idx + 1)
         return current_hidden
 
+    def aggregate_step_ema(
+        self,
+        episode_memory: torch.Tensor,
+        current_hidden: torch.Tensor,
+        episode_idx: int,
+    ) -> torch.Tensor:
+        if episode_idx <= 0:
+            return current_hidden
+        prev_memory = self._ema_from_finals(episode_memory[:, :episode_idx, :])
+        return self.ema_beta * prev_memory + (1.0 - self.ema_beta) * current_hidden
+
     def aggregate_step(
         self,
         episode_memory: torch.Tensor,
@@ -369,6 +431,8 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
     ) -> torch.Tensor:
         if self.aggregator_type == "concat":
             return self.aggregate_step_concat(episode_memory, current_hidden, episode_idx)
+        if self.aggregator_type == "ema":
+            return self.aggregate_step_ema(episode_memory, current_hidden, episode_idx)
         return self.aggregate_step_mean(episode_memory, current_hidden, episode_idx)
 
     def _heads(self, z_task: torch.Tensor, current_obs: torch.Tensor):
@@ -530,14 +594,14 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         """Forward only current episode prefix using detached previous context.
 
         This is the fast stop-gradient context path for sequential PPO. It is
-        only defined for aggregator_type='mean'. Previous episodes are supplied
-        as already-computed detached final embeddings; gradients flow through
-        the current episode prefix and heads, but not through previous episodes.
+        defined for aggregator_type='mean' and 'ema'. Previous episodes are
+        supplied as already-computed detached final embeddings; gradients flow
+        through the current episode prefix and heads, but not through previous episodes.
 
         Returns policy/value for current episode positions 0..last_step only.
         """
-        if self.aggregator_type != "mean":
-            raise ValueError("Detached context reuse is only valid with aggregator_type='mean'")
+        if self.aggregator_type not in ["mean", "ema"]:
+            raise ValueError("Detached context reuse is only valid with aggregator_type='mean' or 'ema'")
         if agent_inputs.ndim != 4:
             raise ValueError(f"agent_inputs must be (B,E,T,D), got {agent_inputs.shape}")
         B, E, T, D = agent_inputs.shape
@@ -561,19 +625,26 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
             z_task = h_cur
         else:
             if context_episode_indices is None:
-                prev_sum = context_finals[:, :episode_idx, :].sum(dim=1)
-                z_task = (prev_sum[:, None, :] + h_cur) / float(episode_idx + 1)
+                selected_finals = context_finals[:, :episode_idx, :]
             else:
-                used = len(context_episode_indices)
-                if used == 0:
-                    z_task = h_cur
+                for ep in context_episode_indices:
+                    if ep < 0 or ep >= episode_idx:
+                        raise ValueError(f"context episode {ep} must be in [0, {episode_idx})")
+                selected_finals = context_finals[:, context_episode_indices, :]
+
+            if selected_finals.shape[1] == 0:
+                z_task = h_cur
+            elif self.aggregator_type == "mean":
+                if context_episode_indices is None:
+                    prev_sum = selected_finals.sum(dim=1)
+                    z_task = (prev_sum[:, None, :] + h_cur) / float(episode_idx + 1)
                 else:
-                    for ep in context_episode_indices:
-                        if ep < 0 or ep >= episode_idx:
-                            raise ValueError(f"context episode {ep} must be in [0, {episode_idx})")
-                    prev_sum = context_finals[:, context_episode_indices, :].sum(dim=1)
-                    prev_mean = prev_sum / float(used)
+                    # Approximate the full previous-episode mean using sampled episodes.
+                    prev_mean = selected_finals.mean(dim=1)
                     z_task = (float(episode_idx) * prev_mean[:, None, :] + h_cur) / float(episode_idx + 1)
+            else:  # ema
+                prev_memory = self._ema_from_finals(selected_finals)
+                z_task = self.ema_beta * prev_memory[:, None, :] + (1.0 - self.ema_beta) * h_cur
 
         obs_prefix = current_obs[:, episode_idx, window_start:prefix_len, :]
         policy_out, value = self._heads(z_task, obs_prefix)
@@ -627,13 +698,12 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         prefix_len = last_step + 1
 
         # Optional sampled context mode. This is meant for large trial_length and
-        # aggregator_type='mean'. It avoids forwarding all previous episodes.
+        # aggregator_type='mean' or 'ema'. It avoids forwarding all previous episodes.
         if context_episode_indices is not None:
-            if self.aggregator_type != "mean":
-                raise ValueError("context_episode_indices is only valid with aggregator_type='mean'")
+            if self.aggregator_type not in ["mean", "ema"]:
+                raise ValueError("context_episode_indices is only valid with aggregator_type='mean' or 'ema'")
 
-            prev_sum = agent_inputs.new_zeros(B, self.hidden_size)
-            used = 0
+            prev_finals = []
             for ep_idx in context_episode_indices:
                 if ep_idx < 0 or ep_idx >= last_episode:
                     raise ValueError(
@@ -642,24 +712,25 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
                 # Previous episodes are represented by a short window ending at
                 # the episode's final stored timestep when context_seq_len > 0.
                 prev_window = self._prev_episode_window(agent_inputs[:, ep_idx, :, :])
-                h_prev_final = self._encode_episode_final(prev_window)
-                prev_sum = prev_sum + h_prev_final
-                used += 1
+                prev_finals.append(self._encode_episode_final(prev_window))
 
             window_start = self._window_start(last_step)
             x_cur = self.input_encoder(agent_inputs[:, last_episode, window_start:prefix_len, :])
             h_cur = self.model(inputs_embeds=x_cur, use_cache=False, return_dict=True).last_hidden_state
 
-            # 1. Unbiased full mean approximation of previous episodes
-            if used > 0:
-                prev_mean = prev_sum / float(used)
-                z_task = (float(last_episode) * prev_mean[:, None, :] + h_cur) / float(last_episode + 1)
-            else:
+            if len(prev_finals) == 0:
                 z_task = h_cur
+            else:
+                prev_finals = torch.stack(prev_finals, dim=1)
+                if self.aggregator_type == "mean":
+                    # Approximate the full previous-episode mean using sampled episodes.
+                    prev_mean = prev_finals.mean(dim=1)
+                    z_task = (float(last_episode) * prev_mean[:, None, :] + h_cur) / float(last_episode + 1)
+                else:  # ema
+                    # Apply EMA to sampled previous episodes in chronological order.
+                    prev_memory = self._ema_from_finals(prev_finals)
+                    z_task = self.ema_beta * prev_memory[:, None, :] + (1.0 - self.ema_beta) * h_cur
 
-            # 2. Normal mean
-            # z_task = (prev_sum[:, None, :] + h_cur) / float(used + 1)
-            
             obs_prefix = current_obs[:, last_episode, window_start:prefix_len, :]
             policy_out, value = self._heads(z_task, obs_prefix)
             if not return_dict:
@@ -692,6 +763,16 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
                         prev_window = self._prev_episode_window(agent_inputs[:, ep_idx, :, :])
                         prev_sum = prev_sum + self._encode_episode_final(prev_window)
                     z_task = (prev_sum[:, None, :] + h_cur) / float(last_episode + 1)
+                else:
+                    z_task = h_cur
+            elif self.aggregator_type == "ema":
+                if last_episode > 0:
+                    prev_finals = []
+                    for ep_idx in range(last_episode):
+                        prev_window = self._prev_episode_window(agent_inputs[:, ep_idx, :, :])
+                        prev_finals.append(self._encode_episode_final(prev_window))
+                    prev_memory = self._ema_from_finals(torch.stack(prev_finals, dim=1))
+                    z_task = self.ema_beta * prev_memory[:, None, :] + (1.0 - self.ema_beta) * h_cur
                 else:
                     z_task = h_cur
             else:
@@ -737,6 +818,19 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
                 z_ep = (prev_sum[:, None, :] + h_ep) / float(ep_idx + 1)
                 z_list.append(z_ep)
                 prev_sum = prev_sum + h_ep[:, -1, :]
+        elif self.aggregator_type == "ema":
+            z_list = []
+            prev_memory = None
+            for ep_idx, h_ep in enumerate(h_list):
+                if prev_memory is None:
+                    z_ep = h_ep
+                else:
+                    z_ep = self.ema_beta * prev_memory[:, None, :] + (1.0 - self.ema_beta) * h_ep
+                z_list.append(z_ep)
+                if prev_memory is None:
+                    prev_memory = h_ep[:, -1, :]
+                else:
+                    prev_memory = self._ema_update(prev_memory, h_ep[:, -1, :])
         else:
             W = self._aggregator_weight_by_slot()
             bias = self.episode_aggregator.bias
@@ -763,7 +857,7 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         """Allocate episode memory.
 
         num_episodes can be larger than the training trial length for evaluation
-        when aggregator_type='mean'. The slot-specific concat aggregator is tied
+        when aggregator_type is mean/ema. The slot-specific concat aggregator is tied
         to self.num_episodes and cannot extrapolate to extra slots.
         """
         device = device or next(self.parameters()).device
@@ -772,7 +866,7 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         if self.aggregator_type == "concat" and num_episodes != self.num_episodes:
             raise ValueError(
                 "num_episodes different from training self.num_episodes is only supported "
-                "with aggregator_type='mean'."
+                "with aggregator_type='mean' or 'ema'."
             )
         return torch.zeros(batch_size, num_episodes, self.hidden_size, device=device)
 
