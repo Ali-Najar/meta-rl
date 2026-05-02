@@ -50,3 +50,12 @@ csv_outputs/nostateproj_run000/ttt_ecet_policy.pth
 csv_outputs/stateproj_run002/config.json
 csv_outputs/stateproj_run002/metrics.csv
 csv_outputs/stateproj_run002/ttt_ecet_policy.pth
+csv_outputs/eval_len_5_anysuccess.png
+csv_outputs/detachcontext_run002/config.json
+csv_outputs/detachcontext_run002/eval_episode_success.csv
+csv_outputs/detachcontext_run002/metrics.csv
+csv_outputs/detachcontext_run002/ttt_ecet_policy.pth
+csv_outputs/stateproj-largechunk_run000/config.json
+csv_outputs/stateproj-largechunk_run000/eval_episode_success.csv
+csv_outputs/stateproj-largechunk_run000/metrics.csv
+csv_outputs/stateproj-largechunk_run000/ttt_ecet_policy.pth

@@ -598,9 +598,22 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         return RLModelOutput(policy=policy_out, value=value, hidden_states=hidden_prefix, cache_params=None)
 
     @torch.no_grad()
-    def init_episode_memory(self, batch_size: int, device=None):
+    def init_episode_memory(self, batch_size: int, device=None, num_episodes: Optional[int] = None):
+        """Allocate episode memory.
+
+        num_episodes can be larger than the training trial length for evaluation
+        when aggregator_type='mean'. The slot-specific concat aggregator is tied
+        to self.num_episodes and cannot extrapolate to extra slots.
+        """
         device = device or next(self.parameters()).device
-        return torch.zeros(batch_size, self.num_episodes, self.hidden_size, device=device)
+        if num_episodes is None:
+            num_episodes = self.num_episodes
+        if self.aggregator_type == "concat" and num_episodes != self.num_episodes:
+            raise ValueError(
+                "num_episodes different from training self.num_episodes is only supported "
+                "with aggregator_type='mean'."
+            )
+        return torch.zeros(batch_size, num_episodes, self.hidden_size, device=device)
 
     def act_step(
         self,

@@ -100,40 +100,53 @@ def build_metaworld(args):
 
 @torch.no_grad()
 def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=device):
+    """Run one max-length eval trial and summarize arbitrary prefixes.
+
+    Evaluation runs for args.eval_trial_length episodes once. Metrics for every
+    length in args.eval_report_lengths are computed from prefixes of that same
+    rollout, e.g. length 5 uses episodes 1..5 from a 25-episode eval.
+    """
     classes = meta_learning.test_classes
     tasks = meta_learning.test_tasks
     n = args.eval_num_tasks
+    eval_trial_length = args.eval_trial_length
+    report_lengths = tuple(args.eval_report_lengths)
+
+    if model.aggregator_type == "concat" and eval_trial_length != model.num_episodes:
+        raise ValueError(
+            "Evaluation trial length different from training trial_length is only "
+            "supported with aggregator_type='mean'. The concat/slot aggregator has "
+            "a fixed number of learned episode slots."
+        )
 
     envs = gym.vector.SyncVectorEnv(
         [make_sampler_env(classes, tasks, args.seed + 10_000 + i) for i in range(n)]
     )
 
     action_dim = envs.single_action_space.shape[0]
+    eval_class_names = list(classes.keys())
+    if n < len(eval_class_names):
+        raise ValueError(
+            f"eval_num_tasks={n} is smaller than number of test classes={len(eval_class_names)}. "
+            "Increase --eval_num_tasks if you want every test class represented."
+        )
 
-    final_rewards = []
-    final_successes = []
-    any_successes = []
+    # Store raw per-trial, per-episode data so arbitrary prefixes can be computed.
+    # Shapes: (R, N, L), where R=eval_num_trials, N=eval_num_tasks, L=eval_trial_length.
+    returns = np.zeros((args.eval_num_trials, n, eval_trial_length), dtype=np.float32)
+    successes = np.zeros((args.eval_num_trials, n, eval_trial_length), dtype=bool)
+    env_names = np.empty((args.eval_num_trials, n), dtype=object)
 
-    adaptation_returns = np.zeros((args.trial_length,), dtype=np.float32)
-    adaptation_success = np.zeros((args.trial_length,), dtype=np.float32)
-    adaptation_count = np.zeros((args.trial_length,), dtype=np.float32)
+    detailed_rows = []
 
-    for _ in range(args.eval_num_trials):
-        
-        eval_class_names = list(classes.keys())
-
-        if n < len(eval_class_names):
-            raise ValueError(
-                f"eval_num_tasks={n} is smaller than number of test classes={len(eval_class_names)}. "
-                "Increase --eval_num_tasks if you want every test class represented."
-            )
-
-        # Repeat class names until we have n env assignments, then shuffle.
+    for eval_round in range(args.eval_num_trials):
+        # Balance classes across eval workers, then sample one variation per worker.
         assigned_classes = []
         while len(assigned_classes) < n:
             assigned_classes.extend(eval_class_names)
         assigned_classes = assigned_classes[:n]
         np.random.shuffle(assigned_classes)
+        env_names[eval_round, :] = assigned_classes
 
         for env, env_name in zip(envs.envs, assigned_classes):
             env.sample_new_task(env_name=env_name)
@@ -141,14 +154,17 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
         raw_obs, _ = envs.reset()
         obs = obs_normalizer.normalize(raw_obs)
 
-        episode_memory = model.init_episode_memory(n, device=device)
+        episode_memory = model.init_episode_memory(
+            n,
+            device=device,
+            num_episodes=eval_trial_length,
+        )
         prev_action = np.zeros((n, action_dim), dtype=np.float32)
         prev_reward = np.zeros((n, 1), dtype=np.float32)
         prev_done = np.zeros((n, 1), dtype=np.float32)
+        cumulative_any = np.zeros(n, dtype=bool)
 
-        trial_any_success = np.zeros(n, dtype=bool)
-
-        for ep in range(args.trial_length):
+        for ep in range(eval_trial_length):
             ep_rewards = np.zeros(n, dtype=np.float32)
             ep_success = np.zeros(n, dtype=bool)
             cache_params = None
@@ -178,46 +194,69 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
                     break
 
             episode_memory[:, ep, :] = out.hidden_states.detach()
+            returns[eval_round, :, ep] = ep_rewards
+            successes[eval_round, :, ep] = ep_success
+            cumulative_any = np.logical_or(cumulative_any, ep_success)
 
-            adaptation_returns[ep] += ep_rewards.mean()
-            adaptation_success[ep] += ep_success.mean()
-            adaptation_count[ep] += 1
+            for env_idx in range(n):
+                detailed_rows.append(
+                    {
+                        "eval_round": eval_round,
+                        "eval_trial_id": eval_round * n + env_idx,
+                        "env_index": env_idx,
+                        "env_name": assigned_classes[env_idx],
+                        "episode_index": ep + 1,
+                        "episode_return": float(ep_rewards[env_idx]),
+                        "episode_success": int(ep_success[env_idx]),
+                        "cum_anysuccess": int(cumulative_any[env_idx]),
+                    }
+                )
 
-            trial_any_success = np.logical_or(trial_any_success, ep_success)
-
-            if ep == args.trial_length - 1:
-                final_rewards.extend(ep_rewards.tolist())
-                final_successes.extend(ep_success.tolist())
-
-            if ep < args.trial_length - 1:
+            if ep < eval_trial_length - 1:
                 raw_obs, _ = envs.reset()
                 obs = obs_normalizer.normalize(raw_obs)
                 prev_action[:] = 0.0
                 prev_reward[:] = 0.0
                 prev_done[:] = 0.0
 
-        any_successes.extend(trial_any_success.tolist())
-
     envs.close()
 
-    adaptation_returns /= np.maximum(adaptation_count, 1)
-    adaptation_success /= np.maximum(adaptation_count, 1)
+    summaries = {}
 
-    print("Eval adaptation curve:")
-    for ep in range(args.trial_length):
+    print("Eval adaptation curve from one max-length rollout:")
+    for ep in range(eval_trial_length):
+        mean_ret = float(returns[:, :, ep].mean())
+        mean_succ = float(successes[:, :, ep].mean())
+        cum_any = float(successes[:, :, : ep + 1].any(axis=2).mean())
         print(
-            f"  ep {ep + 1:02d}: "
-            f"return={adaptation_returns[ep]:.2f}, "
-            f"success={100 * adaptation_success[ep]:.1f}%"
+            f"  ep {ep + 1:02d}: return={mean_ret:.2f}, "
+            f"success={100 * mean_succ:.1f}%, any<=ep={100 * cum_any:.1f}%"
         )
 
-    eval_final_return = float(np.mean(final_rewards)) if final_rewards else float("nan")
-    eval_final_success = float(np.mean(final_successes)) if final_successes else float("nan")
-    eval_anysuccess = float(np.mean(any_successes)) if any_successes else float("nan")
+    for length in report_lengths:
+        prefix_returns = returns[:, :, :length]
+        prefix_successes = successes[:, :, :length]
+        final_returns = returns[:, :, length - 1]
+        final_successes = successes[:, :, length - 1]
+        any_successes = prefix_successes.any(axis=2)
 
-    print(f"Eval anysuccess across trial: {100 * eval_anysuccess:.1f}%")
+        prefix = f"eval_len_{length}"
+        summaries[f"{prefix}_trial_return"] = float(prefix_returns.sum(axis=2).mean())
+        summaries[f"{prefix}_final_return"] = float(final_returns.mean())
+        summaries[f"{prefix}_final_success"] = float(final_successes.mean())
+        summaries[f"{prefix}_anysuccess"] = float(any_successes.mean())
+        summaries[f"{prefix}_mean_ep_success"] = float(prefix_successes.mean())
 
-    return eval_final_return, eval_final_success, eval_anysuccess
+        print(
+            f"Eval prefix {length}: "
+            f"trial_return={summaries[f'{prefix}_trial_return']:.2f}, "
+            f"final_return={summaries[f'{prefix}_final_return']:.2f}, "
+            f"final_success={100 * summaries[f'{prefix}_final_success']:.1f}%, "
+            f"anysuccess={100 * summaries[f'{prefix}_anysuccess']:.1f}%, "
+            f"mean_ep_success={100 * summaries[f'{prefix}_mean_ep_success']:.1f}%"
+        )
+
+    return summaries, detailed_rows
 
 
 def train():
@@ -234,6 +273,14 @@ def train():
 
     if args.task_set not in ["ML1", "ML10", "ML45"]:
         raise ValueError("This refactored trainer is for ML1/ML10/ML45.")
+
+    if args.aggregator_type == "concat" and args.eval_trial_length != args.trial_length:
+        warnings.warn(
+            "--eval_trial_length different from --trial_length is only supported with "
+            "--aggregator_type=mean. The concat/slot aggregator has a fixed number "
+            "of learned episode slots and will error if evaluated with a different length.",
+            UserWarning,
+        )
     
     if args.ppo_context_episode_sample > 0 and args.ppo_sequential_loss_scope == "prefix":
         warnings.warn(
@@ -326,22 +373,51 @@ def train():
     print(f"Run directory: {out_dir}")
 
     csv_path = os.path.join(out_dir, "metrics.csv")
+    eval_metric_keys = []
+    for length in args.eval_report_lengths:
+        prefix = f"eval_len_{length}"
+        eval_metric_keys.extend(
+            [
+                f"{prefix}_trial_return",
+                f"{prefix}_final_return",
+                f"{prefix}_final_success",
+                f"{prefix}_anysuccess",
+                f"{prefix}_mean_ep_success",
+            ]
+        )
+
+    metrics_header = [
+        "update",
+        "timestep",
+        "rollout_trial_return",
+        "rollout_final_return",
+        "rollout_final_success",
+        "rollout_anysuccess",
+        *eval_metric_keys,
+        "loss",
+        "policy_loss",
+        "value_loss",
+        "entropy",
+    ]
+
     with open(csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(metrics_header)
+
+    eval_episode_csv_path = os.path.join(out_dir, "eval_episode_success.csv")
+    with open(eval_episode_csv_path, "w", newline="") as f:
         csv.writer(f).writerow(
             [
                 "update",
                 "timestep",
-                "rollout_trial_return",
-                "rollout_final_return",
-                "rollout_final_success",
-                "rollout_anysuccess",
-                "eval_final_return",
-                "eval_final_success",
-                "eval_anysuccess",
-                "loss",
-                "policy_loss",
-                "value_loss",
-                "entropy",
+                "eval_trial_length",
+                "eval_round",
+                "eval_trial_id",
+                "env_index",
+                "env_name",
+                "episode_index",
+                "episode_return",
+                "episode_success",
+                "cum_anysuccess",
             ]
         )
 
@@ -476,14 +552,12 @@ def train():
             f"anysuccess={100 * rollout_anysuccess:.1f}%"
         )
 
-        eval_ret = np.nan
-        eval_succ = np.nan
-        eval_anysuccess = np.nan
+        eval_summaries = {key: np.nan for key in eval_metric_keys}
 
         if (update + 1) % args.eval_interval == 0:
             print("policy std:", model.get_policy_std().detach().cpu().numpy())
 
-            eval_ret, eval_succ, eval_anysuccess = evaluate_meta_learning(
+            eval_summaries, eval_rows = evaluate_meta_learning(
                 model,
                 meta_learning,
                 obs_normalizer,
@@ -491,30 +565,41 @@ def train():
                 device=device,
             )
 
-            print(
-                f"Eval final return={eval_ret:.2f}, "
-                f"final_success={100 * eval_succ:.1f}%, "
-                f"anysuccess={100 * eval_anysuccess:.1f}%"
-            )
+            with open(eval_episode_csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                for row in eval_rows:
+                    writer.writerow(
+                        [
+                            update + 1,
+                            global_timesteps,
+                            args.eval_trial_length,
+                            row["eval_round"],
+                            row["eval_trial_id"],
+                            row["env_index"],
+                            row["env_name"],
+                            row["episode_index"],
+                            row["episode_return"],
+                            row["episode_success"],
+                            row["cum_anysuccess"],
+                        ]
+                    )
+
+        metrics_row = [
+            update + 1,
+            global_timesteps,
+            rollout_trial_return,
+            rollout_final_return,
+            rollout_final_success,
+            rollout_anysuccess,
+            *[eval_summaries.get(key, np.nan) for key in eval_metric_keys],
+            loss,
+            p_loss,
+            v_loss,
+            ent,
+        ]
 
         with open(csv_path, "a", newline="") as f:
-            csv.writer(f).writerow(
-                [
-                    update + 1,
-                    global_timesteps,
-                    rollout_trial_return,
-                    rollout_final_return,
-                    rollout_final_success,
-                    rollout_anysuccess,
-                    eval_ret,
-                    eval_succ,
-                    eval_anysuccess,
-                    loss,
-                    p_loss,
-                    v_loss,
-                    ent,
-                ]
-            )
+            csv.writer(f).writerow(metrics_row)
 
         if scheduler is not None:
             scheduler.step()

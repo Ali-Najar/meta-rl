@@ -18,6 +18,16 @@ def parse_hidden_sizes(value):
     return tuple(int(x.strip()) for x in value.split(",") if x.strip())
 
 
+def parse_int_list(value):
+    """Parse comma-separated integer lists, e.g. 5,25."""
+    if value is None:
+        return None
+    value = str(value).strip().lower()
+    if value in ["", "none", "0"]:
+        return None
+    return tuple(int(x.strip()) for x in value.split(",") if x.strip())
+
+
 def get_args():
     parser = argparse.ArgumentParser(description="TTT-ECET-style PPO Training")
 
@@ -90,7 +100,25 @@ def get_args():
 
     parser.add_argument("--eval_interval", type=int, default=5, help="Evaluate every N updates.")
     parser.add_argument("--eval_num_tasks", type=int, default=25, help="Sample this many eval variations, not all variations.")
-    parser.add_argument("--eval_num_trials", type=int, default=1, help="Number of trials to evaluate per task.")
+    parser.add_argument("--eval_num_trials", type=int, default=1, help="Number of evaluation trials per vectorized eval worker.")
+    parser.add_argument(
+        "--eval_trial_length",
+        type=int,
+        default=None,
+        help=(
+            "Number of episodes to run per evaluation trial. If omitted, uses --trial_length. "
+            "This can be larger than training trial_length when aggregator_type=mean."
+        ),
+    )
+    parser.add_argument(
+        "--eval_report_lengths",
+        type=parse_int_list,
+        default=None,
+        help=(
+            "Comma-separated prefix lengths to summarize from one eval rollout, e.g. 5,25. "
+            "Evaluation runs once for --eval_trial_length episodes, then reports metrics for these prefixes."
+        ),
+    )
     parser.add_argument("--comment", type=str, default="")
 
     # Run/output management.
@@ -140,4 +168,28 @@ def get_args():
         ),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.eval_trial_length is None:
+        args.eval_trial_length = args.trial_length
+
+    if args.eval_report_lengths is None:
+        args.eval_report_lengths = (args.eval_trial_length,)
+    else:
+        seen = set()
+        cleaned = []
+        for length in args.eval_report_lengths:
+            if length <= 0:
+                raise ValueError("All --eval_report_lengths must be positive.")
+            if length not in seen:
+                seen.add(length)
+                cleaned.append(length)
+        args.eval_report_lengths = tuple(cleaned)
+
+    if max(args.eval_report_lengths) > args.eval_trial_length:
+        raise ValueError(
+            f"max(eval_report_lengths)={max(args.eval_report_lengths)} is larger than "
+            f"eval_trial_length={args.eval_trial_length}. Increase --eval_trial_length."
+        )
+
+    return args
