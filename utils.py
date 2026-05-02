@@ -487,15 +487,18 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
                         mean, log_std = outputs.policy
                         values = outputs.value
 
-                        actions_seq = b_actions[env_idx, ep_idx, :step_end]
-                        old_seq = b_old_log_probs[env_idx, ep_idx, :step_end]
-                        adv_seq = b_adv[env_idx, ep_idx, :step_end]
-                        returns_seq = b_returns[env_idx, ep_idx, :step_end]
+                        offset = getattr(outputs, "time_offset", 0)
+                        actions_seq = b_actions[env_idx, ep_idx, offset:step_end]
+                        old_seq = b_old_log_probs[env_idx, ep_idx, offset:step_end]
+                        adv_seq = b_adv[env_idx, ep_idx, offset:step_end]
+                        returns_seq = b_returns[env_idx, ep_idx, offset:step_end]
                         if loss_scope == "chunk":
-                            pos = torch.arange(step_start, step_end, device=device)
+                            pos_start = max(step_start, offset) - offset
+                            pos_end = step_end - offset
+                            pos = torch.arange(pos_start, pos_end, device=device)
                         elif loss_scope == "prefix":
-                            # Prefix means current-episode prefix only in detached
-                            # context mode. Previous episodes are context only.
+                            # Prefix means current-episode prefix/window only in
+                            # detached context mode. Previous episodes are context only.
                             pos = None
                         else:
                             raise ValueError("ppo_sequential_loss_scope must be 'chunk' or 'prefix'")
@@ -511,7 +514,9 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
                         mean, log_std = outputs.policy
                         values = outputs.value
 
-                        if context_indices is None:
+                        offset = getattr(outputs, "time_offset", 0)
+                        windowed_current_only = getattr(model, "context_seq_len", 0) > 0
+                        if context_indices is None and not windowed_current_only:
                             actions_seq = _concat_episode_prefix(b_actions, env_idx, ep_idx, step_end)
                             old_seq = _concat_episode_prefix(b_old_log_probs[..., None], env_idx, ep_idx, step_end).squeeze(-1)
                             adv_seq = _concat_episode_prefix(b_adv[..., None], env_idx, ep_idx, step_end).squeeze(-1)
@@ -524,13 +529,17 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
                             else:
                                 raise ValueError("ppo_sequential_loss_scope must be 'chunk' or 'prefix'")
                         else:
-                            # Sampled-context mode returns only current episode prefix.
-                            actions_seq = b_actions[env_idx, ep_idx, :step_end]
-                            old_seq = b_old_log_probs[env_idx, ep_idx, :step_end]
-                            adv_seq = b_adv[env_idx, ep_idx, :step_end]
-                            returns_seq = b_returns[env_idx, ep_idx, :step_end]
+                            # Sampled-context mode and context_seq_len window mode
+                            # return only current-episode outputs. Previous episodes
+                            # are context only.
+                            actions_seq = b_actions[env_idx, ep_idx, offset:step_end]
+                            old_seq = b_old_log_probs[env_idx, ep_idx, offset:step_end]
+                            adv_seq = b_adv[env_idx, ep_idx, offset:step_end]
+                            returns_seq = b_returns[env_idx, ep_idx, offset:step_end]
                             if loss_scope == "chunk":
-                                pos = torch.arange(step_start, step_end, device=device)
+                                pos_start = max(step_start, offset) - offset
+                                pos_end = step_end - offset
+                                pos = torch.arange(pos_start, pos_end, device=device)
                             elif loss_scope == "prefix":
                                 pos = None
                             else:

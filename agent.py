@@ -116,6 +116,7 @@ class RLModelOutput:
     value: torch.FloatTensor
     hidden_states: Optional[torch.FloatTensor] = None
     cache_params: Optional[TTTCache] = None
+    time_offset: int = 0
 
 
 def orthogonal_init(module, gain=np.sqrt(2.0)):
@@ -168,6 +169,8 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         aggregator_type: str = "concat",
         use_state_proj: bool = True,
         init_type: str = "xavier",
+        context_seq_len: int = 0,
+        prev_context_window_mode: str = "last",
         min_std: float = 0.5,
         max_std: float = 1.5,
         init_std: float = 1.0,
@@ -183,6 +186,14 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         self.aggregator_type = aggregator_type
         self.use_state_proj = use_state_proj
         self.init_type = init_type
+        self.context_seq_len = int(context_seq_len or 0)
+        self.prev_context_window_mode = str(prev_context_window_mode or "last")
+
+        if self.context_seq_len < 0:
+            raise ValueError("context_seq_len must be >= 0. Use 0 for full episode context.")
+
+        if self.prev_context_window_mode not in ["last", "random"]:
+            raise ValueError("prev_context_window_mode must be either 'last' or 'random'")
 
         if self.aggregator_type not in ["concat", "mean"]:
             raise ValueError("aggregator_type must be either 'concat' or 'mean'")
@@ -399,6 +410,74 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         return RLModelOutput(policy=policy_out, value=value, hidden_states=episode_hidden, cache_params=None)
 
 
+    def _window_start(self, end_step: int) -> int:
+        """Start index for a context window ending at end_step inclusive."""
+        if self.context_seq_len <= 0:
+            return 0
+        return max(0, end_step + 1 - self.context_seq_len)
+
+    def _episode_window(
+        self,
+        episode_inputs: torch.Tensor,
+        end_step: Optional[int] = None,
+        random_window: bool = False,
+    ) -> torch.Tensor:
+        """Slice an episode tensor to a context window.
+
+        episode_inputs: (B, T, D).
+
+        If context_seq_len=0, returns the full prefix through end_step.
+
+        If context_seq_len>0 and random_window=False, returns the last
+        context_seq_len tokens ending at end_step. This is used for the
+        current episode because the context must lead to the current state.
+
+        If context_seq_len>0 and random_window=True, samples one contiguous
+        window of length context_seq_len from the available episode/prefix.
+        This is intended only for previous completed episodes during PPO.
+        """
+        if episode_inputs.ndim != 3:
+            raise ValueError(f"episode_inputs must be (B,T,D), got {episode_inputs.shape}")
+        T = episode_inputs.shape[1]
+        if end_step is None:
+            end_step = T - 1
+        if end_step < 0 or end_step >= T:
+            raise ValueError(f"end_step={end_step} is out of range for T={T}")
+
+        if self.context_seq_len <= 0:
+            return episode_inputs[:, : end_step + 1, :]
+
+        available = end_step + 1
+        window_len = min(self.context_seq_len, available)
+
+        if random_window and available > window_len:
+            max_start = available - window_len
+            start = int(torch.randint(0, max_start + 1, (1,), device=episode_inputs.device).item())
+        else:
+            start = available - window_len
+
+        return episode_inputs[:, start : start + window_len, :]
+
+    def _prev_episode_window(self, episode_inputs: torch.Tensor) -> torch.Tensor:
+        """Context window for a previous completed episode during PPO.
+
+        With --prev_context_window_mode last, this is the final window.
+        With --prev_context_window_mode random, this is a random contiguous
+        window. The current episode never uses this helper; its window always
+        ends at the current state.
+        """
+        return self._episode_window(
+            episode_inputs,
+            end_step=None,
+            random_window=(self.prev_context_window_mode == "random"),
+        )
+
+    def _encode_episode_final(self, episode_inputs: torch.Tensor) -> torch.Tensor:
+        """Encode one episode/window and return the final hidden state."""
+        x = self.input_encoder(episode_inputs)
+        h = self.model(inputs_embeds=x, use_cache=False, return_dict=True).last_hidden_state
+        return h[:, -1, :]
+
     @torch.no_grad()
     def encode_episode_finals_detached(self, agent_inputs: torch.Tensor) -> torch.Tensor:
         """Encode each full episode once and return detached final embeddings.
@@ -415,10 +494,28 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
             raise ValueError(f"agent_inputs must be (B,E,T,D), got {agent_inputs.shape}")
         B, E, T, D = agent_inputs.shape
         H = self.hidden_size
-        x = self.input_encoder(agent_inputs.reshape(B * E, T, D))
-        h = self.model(inputs_embeds=x, use_cache=False, return_dict=True).last_hidden_state
-        finals = h[:, -1, :].reshape(B, E, H)
-        return finals.detach()
+
+        # If context_seq_len > 0, each completed episode is represented by
+        # one context window. For previous-episode context, that window is
+        # either the final window or a random contiguous window depending on
+        # prev_context_window_mode. If context_seq_len == 0, this is the old
+        # full-episode encoding.
+        if self.context_seq_len <= 0 or self.prev_context_window_mode == "last":
+            start = 0 if self.context_seq_len <= 0 else max(0, T - self.context_seq_len)
+            window = agent_inputs[:, :, start:T, :]
+            W = window.shape[2]
+            x = self.input_encoder(window.reshape(B * E, W, D))
+            h = self.model(inputs_embeds=x, use_cache=False, return_dict=True).last_hidden_state
+            finals = h[:, -1, :].reshape(B, E, H)
+            return finals.detach()
+
+        # Random-window mode cannot be flattened with a shared start because
+        # each episode slot may sample a different start. Encode slot by slot.
+        finals = []
+        for ep_idx in range(E):
+            window = self._prev_episode_window(agent_inputs[:, ep_idx, :, :])
+            finals.append(self._encode_episode_final(window))
+        return torch.stack(finals, dim=1).detach()
 
     def forward_current_prefix_with_context(
         self,
@@ -455,7 +552,9 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
             )
 
         prefix_len = last_step + 1
-        x_cur = self.input_encoder(agent_inputs[:, episode_idx, :prefix_len, :])
+        window_start = self._window_start(last_step)
+        cur_inputs = agent_inputs[:, episode_idx, window_start:prefix_len, :]
+        x_cur = self.input_encoder(cur_inputs)
         h_cur = self.model(inputs_embeds=x_cur, use_cache=False, return_dict=True).last_hidden_state
 
         if episode_idx <= 0:
@@ -476,11 +575,17 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
                     prev_mean = prev_sum / float(used)
                     z_task = (float(episode_idx) * prev_mean[:, None, :] + h_cur) / float(episode_idx + 1)
 
-        obs_prefix = current_obs[:, episode_idx, :prefix_len, :]
+        obs_prefix = current_obs[:, episode_idx, window_start:prefix_len, :]
         policy_out, value = self._heads(z_task, obs_prefix)
         if not return_dict:
             return policy_out, value, h_cur
-        return RLModelOutput(policy=policy_out, value=value, hidden_states=h_cur, cache_params=None)
+        return RLModelOutput(
+            policy=policy_out,
+            value=value,
+            hidden_states=h_cur,
+            cache_params=None,
+            time_offset=window_start,
+        )
 
 
     def forward_prefix_flat(
@@ -534,12 +639,15 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
                     raise ValueError(
                         f"context episode {ep_idx} must be in [0, {last_episode})"
                     )
-                x_prev = self.input_encoder(agent_inputs[:, ep_idx, :, :])
-                h_prev = self.model(inputs_embeds=x_prev, use_cache=False, return_dict=True).last_hidden_state
-                prev_sum = prev_sum + h_prev[:, -1, :]
+                # Previous episodes are represented by a short window ending at
+                # the episode's final stored timestep when context_seq_len > 0.
+                prev_window = self._prev_episode_window(agent_inputs[:, ep_idx, :, :])
+                h_prev_final = self._encode_episode_final(prev_window)
+                prev_sum = prev_sum + h_prev_final
                 used += 1
 
-            x_cur = self.input_encoder(agent_inputs[:, last_episode, :prefix_len, :])
+            window_start = self._window_start(last_step)
+            x_cur = self.input_encoder(agent_inputs[:, last_episode, window_start:prefix_len, :])
             h_cur = self.model(inputs_embeds=x_cur, use_cache=False, return_dict=True).last_hidden_state
 
             # 1. Unbiased full mean approximation of previous episodes
@@ -552,11 +660,64 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
             # 2. Normal mean
             # z_task = (prev_sum[:, None, :] + h_cur) / float(used + 1)
             
-            obs_prefix = current_obs[:, last_episode, :prefix_len, :]
+            obs_prefix = current_obs[:, last_episode, window_start:prefix_len, :]
             policy_out, value = self._heads(z_task, obs_prefix)
             if not return_dict:
                 return policy_out, value, h_cur
-            return RLModelOutput(policy=policy_out, value=value, hidden_states=h_cur, cache_params=None)
+            return RLModelOutput(
+                policy=policy_out,
+                value=value,
+                hidden_states=h_cur,
+                cache_params=None,
+                time_offset=window_start,
+            )
+
+        # Windowed exact mode: previous episodes are summarized by a short
+        # final window, and the current episode is represented by the short
+        # window ending at last_step. This is the ECET-style low-context path.
+        # It returns only current-episode window outputs, with time_offset
+        # indicating where those outputs start in the original episode.
+        if self.context_seq_len > 0:
+            window_start = self._window_start(last_step)
+            h_cur = self.model(
+                inputs_embeds=self.input_encoder(agent_inputs[:, last_episode, window_start:prefix_len, :]),
+                use_cache=False,
+                return_dict=True,
+            ).last_hidden_state
+
+            if self.aggregator_type == "mean":
+                if last_episode > 0:
+                    prev_sum = agent_inputs.new_zeros(B, self.hidden_size)
+                    for ep_idx in range(last_episode):
+                        prev_window = self._prev_episode_window(agent_inputs[:, ep_idx, :, :])
+                        prev_sum = prev_sum + self._encode_episode_final(prev_window)
+                    z_task = (prev_sum[:, None, :] + h_cur) / float(last_episode + 1)
+                else:
+                    z_task = h_cur
+            else:
+                W = self._aggregator_weight_by_slot()
+                bias = self.episode_aggregator.bias
+                prev_contrib = agent_inputs.new_zeros(B, self.hidden_size)
+                for ep_idx in range(last_episode):
+                    prev_window = self._prev_episode_window(agent_inputs[:, ep_idx, :, :])
+                    h_prev_final = self._encode_episode_final(prev_window)
+                    prev_contrib = prev_contrib + torch.einsum(
+                        "bh,oh->bo", h_prev_final, W[:, ep_idx, :]
+                    )
+                current_contrib = torch.einsum("bth,oh->bto", h_cur, W[:, last_episode, :])
+                z_task = current_contrib + prev_contrib[:, None, :] + bias.view(1, 1, self.hidden_size)
+
+            obs_prefix = current_obs[:, last_episode, window_start:prefix_len, :]
+            policy_out, value = self._heads(z_task, obs_prefix)
+            if not return_dict:
+                return policy_out, value, h_cur
+            return RLModelOutput(
+                policy=policy_out,
+                value=value,
+                hidden_states=h_cur,
+                cache_params=None,
+                time_offset=window_start,
+            )
 
         # Exact prefix mode: forward completed previous episodes fully and the
         # current episode only up to last_step. No future tokens are processed.
@@ -622,21 +783,39 @@ class TTTEpisodePolicy(TTTPreTrainedModel):
         episode_memory: torch.Tensor,
         episode_idx: int,
         cache_params: Optional[TTTCache] = None,
+        context_window_inputs: Optional[torch.Tensor] = None,
     ):
-        """One rollout step using TTT cache for the current episode only."""
-        x = self.input_encoder(agent_input[:, None, :])
-        base_outputs = self.model(
-            inputs_embeds=x,
-            cache_params=cache_params,
-            use_cache=True,
-            return_dict=True,
-        )
+        """One rollout/eval step.
+
+        Default behavior is the old cached one-token update over the whole
+        current episode. If context_window_inputs is provided, it should be
+        (B, W, input_dim) and the current hidden state is computed from that
+        window ending at the current state. In that windowed mode, cache is not
+        used because the context is explicitly the short window.
+        """
+        if context_window_inputs is not None:
+            x = self.input_encoder(context_window_inputs)
+            base_outputs = self.model(
+                inputs_embeds=x,
+                cache_params=None,
+                use_cache=False,
+                return_dict=True,
+            )
+        else:
+            x = self.input_encoder(agent_input[:, None, :])
+            base_outputs = self.model(
+                inputs_embeds=x,
+                cache_params=cache_params,
+                use_cache=True,
+                return_dict=True,
+            )
+
         current_hidden = base_outputs.last_hidden_state[:, -1, :]
         z_task = self.aggregate_step(episode_memory, current_hidden, episode_idx)
         policy_out, value = self._heads(z_task, current_obs)
         return RLModelOutput(
             policy=policy_out,
             value=value,
-            cache_params=base_outputs.cache_params,
+            cache_params=None if context_window_inputs is not None else base_outputs.cache_params,
             hidden_states=current_hidden,
         )

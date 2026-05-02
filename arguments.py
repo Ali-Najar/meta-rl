@@ -45,6 +45,30 @@ def get_args():
     parser.add_argument("--mini_batch_size", type=int, default=4)
     parser.add_argument("--ttt_layer_type", type=str, default="mlp", choices=["linear", "mlp"])
 
+    parser.add_argument(
+        "--context_seq_len",
+        type=int,
+        default=0,
+        help=(
+            "TTT context window length per episode. Use 0 to encode the whole episode/prefix. "
+            "If >0, previous episodes are represented by a context_seq_len transition window, "
+            "and rollout/eval/current-episode PPO uses the window ending at the current state."
+        ),
+    )
+    parser.add_argument(
+        "--prev_context_window_mode",
+        type=str,
+        default="last",
+        choices=["last", "random"],
+        help=(
+            "How to choose the context_seq_len window for previous completed episodes during PPO. "
+            "last = use the final window of each previous episode; random = sample a random "
+            "contiguous window from each previous episode. Current episode windows always end at "
+            "the current state. Rollout/eval previous-episode memory remains the observed final "
+            "episode embedding."
+        ),
+    )
+
     # Ablation knobs for the ECET-style additions.
     parser.add_argument(
         "--policy_hidden_sizes",
@@ -191,5 +215,10 @@ def get_args():
             f"max(eval_report_lengths)={max(args.eval_report_lengths)} is larger than "
             f"eval_trial_length={args.eval_trial_length}. Increase --eval_trial_length."
         )
+
+    if args.context_seq_len is None:
+        args.context_seq_len = 0
+    if args.context_seq_len < 0:
+        raise ValueError("--context_seq_len must be >= 0. Use 0 for full-episode context.")
 
     return args

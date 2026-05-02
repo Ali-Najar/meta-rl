@@ -168,13 +168,27 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
             ep_rewards = np.zeros(n, dtype=np.float32)
             ep_success = np.zeros(n, dtype=bool)
             cache_params = None
+            current_episode_inputs = torch.zeros((n, args.rollout_steps, model.input_dim), device=device)
 
             for step in range(args.rollout_steps):
                 agent_input = get_agent_input(obs, prev_action, prev_reward, prev_done, args.agent_mode)
                 inp_t = torch.tensor(agent_input, dtype=torch.float32, device=device)
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+                current_episode_inputs[:, step, :] = inp_t
 
-                out = model.act_step(inp_t, obs_t, episode_memory, ep, cache_params)
+                context_window = None
+                if args.context_seq_len > 0:
+                    win_start = max(0, step + 1 - args.context_seq_len)
+                    context_window = current_episode_inputs[:, win_start : step + 1, :]
+
+                out = model.act_step(
+                    inp_t,
+                    obs_t,
+                    episode_memory,
+                    ep,
+                    cache_params,
+                    context_window_inputs=context_window,
+                )
                 mean, _ = out.policy
                 action_np = mean.cpu().numpy()
 
@@ -292,6 +306,51 @@ def train():
             UserWarning,
         )
 
+    if args.context_seq_len > 0:
+        if args.ppo_update_mode != "sequential":
+            warnings.warn(
+                "--context_seq_len affects rollout/eval, but PPO random mode still uses "
+                "the full forward path unless you use --ppo_update_mode=sequential. "
+                "For consistent efficient training, prefer --ppo_update_mode=sequential.",
+                UserWarning,
+            )
+        effective_chunk_steps = args.ppo_minibatch_steps if args.ppo_minibatch_steps > 0 else args.rollout_steps
+        if args.context_seq_len < effective_chunk_steps:
+            warnings.warn(
+                "--context_seq_len is smaller than the effective PPO chunk length. In sequential "
+                "chunk mode, only transitions inside the available context window are trained for "
+                "each chunk; earlier positions in the chunk are dropped from that gradient step. "
+                "For dense chunk losses, set --ppo_minibatch_steps <= --context_seq_len.",
+                UserWarning,
+            )
+        if args.ppo_sequential_loss_scope == "prefix":
+            warnings.warn(
+                "With --context_seq_len > 0, sequential prefix loss is over the current "
+                "episode context window/prefix only. Previous episodes are used as context "
+                "summaries, not as loss positions.",
+                UserWarning,
+            )
+
+    if args.prev_context_window_mode == "random":
+        if args.context_seq_len <= 0:
+            warnings.warn(
+                "--prev_context_window_mode=random has no effect when --context_seq_len=0, "
+                "because previous episodes are encoded as full episodes.",
+                UserWarning,
+            )
+        if args.ppo_update_mode != "sequential":
+            warnings.warn(
+                "--prev_context_window_mode=random is mainly used by sequential PPO/windowed "
+                "previous-episode encoding. In random PPO mode, it may have little or no effect.",
+                UserWarning,
+            )
+        warnings.warn(
+            "--prev_context_window_mode=random samples random subsequences for previous "
+            "episodes during PPO only. Rollout/eval still store and use the observed final "
+            "episode embedding as memory.",
+            UserWarning,
+        )
+
     if args.detach_context_episodes:
         if args.ppo_update_mode != "sequential":
             warnings.warn(
@@ -361,6 +420,8 @@ def train():
         aggregator_type=args.aggregator_type,
         use_state_proj=args.use_state_proj,
         init_type=args.init_type,
+        context_seq_len=args.context_seq_len,
+        prev_context_window_mode=args.prev_context_window_mode,
         min_std=args.min_std,
         max_std=args.max_std,
         init_std=args.init_std,
@@ -466,9 +527,23 @@ def train():
                 agent_input = get_agent_input(obs, prev_action, prev_reward, prev_done, args.agent_mode)
                 inp_t = torch.tensor(agent_input, dtype=torch.float32, device=device)
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+                b_inputs[:, ep, step, :] = inp_t
+                b_states[:, ep, step, :] = obs_t
+
+                context_window = None
+                if args.context_seq_len > 0:
+                    win_start = max(0, step + 1 - args.context_seq_len)
+                    context_window = b_inputs[:, ep, win_start : step + 1, :]
 
                 with torch.no_grad():
-                    out = model.act_step(inp_t, obs_t, episode_memory, ep, cache_params)
+                    out = model.act_step(
+                        inp_t,
+                        obs_t,
+                        episode_memory,
+                        ep,
+                        cache_params,
+                        context_window_inputs=context_window,
+                    )
                     mean, log_std = out.policy
                     dist = torch.distributions.Normal(mean, log_std.exp())
                     action = dist.sample()
@@ -488,8 +563,6 @@ def train():
                 obs_normalizer.update(next_raw_obs)
                 norm_reward = reward_normalizer.normalize(raw_reward, done.astype(np.float32))
 
-                b_inputs[:, ep, step, :] = inp_t
-                b_states[:, ep, step, :] = obs_t
                 b_actions[:, ep, step, :] = action
                 b_logprobs[:, ep, step] = log_prob
                 b_rewards[:, ep, step] = torch.tensor(norm_reward, dtype=torch.float32, device=device)
