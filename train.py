@@ -87,6 +87,31 @@ def make_sampler_env(classes, tasks, seed):
 
     return thunk
 
+def make_balanced_class_assignment(class_names, num_envs, rng):
+    """Return a shuffled list of class names with near-equal counts.
+
+    Example:
+        ML10, num_envs=50 -> exactly 5 copies of each class.
+        ML10, num_envs=53 -> 5 copies each + 3 random extra classes.
+    """
+    class_names = list(class_names)
+    if len(class_names) == 0:
+        raise ValueError("No task classes available.")
+
+    base = num_envs // len(class_names)
+    remainder = num_envs % len(class_names)
+
+    assigned = []
+    for name in class_names:
+        assigned.extend([name] * base)
+
+    if remainder > 0:
+        extra = rng.choice(class_names, size=remainder, replace=False).tolist()
+        assigned.extend(extra)
+
+    rng.shuffle(assigned)
+    return assigned
+
 
 def build_metaworld(args):
     if args.task_set == "ML10":
@@ -395,6 +420,9 @@ def train():
         ]
     )
 
+    train_class_names = list(meta_learning.train_classes.keys())
+    task_assignment_rng = np.random.default_rng(args.seed + 12345)
+
     obs_dim = envs.single_observation_space.shape[0]
     action_dim = envs.single_action_space.shape[0]
 
@@ -507,8 +535,14 @@ def train():
     for update in range(args.num_updates):
         t0 = time.time()
 
-        for env in envs.envs:
-            env.sample_new_task()
+        assigned_classes = make_balanced_class_assignment(
+            train_class_names,
+            args.num_envs,
+            task_assignment_rng,
+        )
+
+        for env, env_name in zip(envs.envs, assigned_classes):
+            env.sample_new_task(env_name=env_name)
 
         raw_obs, _ = envs.reset()
         obs_normalizer.update(raw_obs)

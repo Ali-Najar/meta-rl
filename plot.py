@@ -33,6 +33,10 @@ def load_metrics(root: Path):
     runs = {}
     for csv_path in csv_files:
         run_name = csv_path.parent.name
+        ##################################
+        if "ML10" not in run_name:
+            continue
+        ##################################
         df = pd.read_csv(csv_path)
         x_col = "timestep" if "timestep" in df.columns else "update"
         df[x_col] = pd.to_numeric(df[x_col], errors="coerce")
@@ -95,7 +99,7 @@ def main():
     parser.add_argument(
         "--eval_report_lengths",
         type=str,
-        default=(5,),
+        default=25,
         help="Comma-separated eval prefix lengths to plot anysuccess for, e.g. 5,25.",
     )
     args = parser.parse_args()

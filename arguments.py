@@ -51,8 +51,9 @@ def get_args():
         default=0,
         help=(
             "TTT context window length per episode. Use 0 to encode the whole episode/prefix. "
-            "If >0, previous episodes are represented by a context_seq_len transition window, "
-            "and rollout/eval/current-episode PPO uses the window ending at the current state."
+            "If >0, sampled training contexts use a context_seq_len transition window. "
+            "SAC rollout/eval always uses cached full-prefix context and does not recompute "
+            "windows."
         ),
     )
     parser.add_argument(
@@ -61,11 +62,11 @@ def get_args():
         default="last",
         choices=["last", "random"],
         help=(
-            "How to choose the context_seq_len window for previous completed episodes during PPO. "
-            "last = use the final window of each previous episode; random = sample a random "
-            "contiguous window from each previous episode. Current episode windows always end at "
-            "the current state. Rollout/eval previous-episode memory remains the observed final "
-            "episode embedding."
+            "How to choose the context_seq_len window for previous completed episodes during "
+            "training-time context reconstruction. last = use the final window of each previous "
+            "episode; random = sample a random contiguous window from each previous episode. "
+            "SAC rollout/eval previous-episode memory remains the observed final episode "
+            "embedding."
         ),
     )
     parser.add_argument(
@@ -217,6 +218,82 @@ def get_args():
         ),
     )
 
+
+    # Online SAC replacement for PPO. Used by train_sac.py.
+    parser.add_argument("--sac_replay_size", type=int, default=100, help="Replay capacity in stored vectorized trial batches.")
+    parser.add_argument(
+        "--sac_batch_size",
+        type=int,
+        default=256,
+        help=(
+            "Legacy transition-batch size. Chunked SAC now uses "
+            "--sac_episode_batch_size * --sac_chunk_steps as the effective "
+            "transition batch size. If --sac_episode_batch_size <= 0, this "
+            "value is used to infer the episode batch size."
+        ),
+    )
+    parser.add_argument(
+        "--sac_episode_batch_size",
+        type=int,
+        default=16,
+        help=(
+            "Number of sampled episodes/chunks per SAC or forecasting update. "
+            "TTT current context is encoded once over each extended episode chunk."
+        ),
+    )
+    parser.add_argument(
+        "--sac_chunk_steps",
+        type=int,
+        default=16,
+        help=(
+            "Number of consecutive timesteps per sampled episode chunk. The current "
+            "episode is encoded through the whole chunk, then the corresponding "
+            "per-timestep contexts are gathered. The effective transition batch size "
+            "is sac_episode_batch_size * sac_chunk_steps."
+        ),
+    )
+    parser.add_argument("--sac_updates_per_rollout", type=int, default=100, help="SAC actor/critic gradient steps after each rollout batch.")
+    parser.add_argument(
+        "--sac_train_epochs",
+        type=int,
+        default=1,
+        help=(
+            "Number of times to repeat the block: TTT forecasting updates, then SAC actor/critic updates, "
+            "after each rollout batch. Total SAC steps per outer update = "
+            "sac_train_epochs * sac_updates_per_rollout."
+        ),
+    )
+    parser.add_argument("--sac_forecast_epochs", type=int, default=10, help="TTT+forecaster updates before SAC updates inside each SAC train epoch.")
+    parser.add_argument(
+        "--sac_initial_forecast_epochs",
+        type=int,
+        default=-1,
+        help=(
+            "Extra TTT+forecaster-only updates run once after the first collected "
+            "rollout and before the normal SAC training block. Use -1 for "
+            "5 * sac_forecast_epochs, or 0 to disable."
+        ),
+    )
+    parser.add_argument("--sac_forecast_horizon", type=int, default=5, help="K-step open-loop forecasting horizon.")
+    parser.add_argument("--sac_forecast_obs_coef", type=float, default=1.0)
+    parser.add_argument("--sac_forecast_reward_coef", type=float, default=1.0)
+    parser.add_argument("--sac_actor_lr", type=float, default=3e-4)
+    parser.add_argument("--sac_critic_lr", type=float, default=3e-4)
+    parser.add_argument("--sac_context_lr", type=float, default=3e-4)
+    parser.add_argument("--sac_alpha", type=float, default=0.2, help="Fixed SAC entropy temperature.")
+    parser.add_argument("--sac_tau", type=float, default=0.005, help="Target critic Polyak update coefficient.")
+    parser.add_argument("--sac_reward_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--sac_random_steps",
+        type=int,
+        default=5000,
+        help="Use random actions until this many env steps are collected.",
+    )
+    parser.add_argument("--sac_context_episode_sample", type=int, default=0, help="Previous episodes sampled as context for SAC/forecast. 0 means all previous episodes.")
+    parser.add_argument("--sac_detach_previous_context", action="store_true", help="Stop gradients through previous episode context windows during SAC/forecast.")
+    parser.add_argument("--sac_update_ttt_with_sac", action="store_true", help="Allow SAC actor/critic losses to update TTT context. Default: TTT only updated by forecasting.")
+    parser.add_argument("--sac_hidden_sizes", type=parse_hidden_sizes, default=(256, 256), help="Actor/critic/forecaster hidden sizes, e.g. 256,256.")
+
     args = parser.parse_args()
 
     if args.eval_trial_length is None:
@@ -248,5 +325,12 @@ def get_args():
         raise ValueError("--ema_beta must be between 0 and 1 inclusive.")
     if args.context_seq_len < 0:
         raise ValueError("--context_seq_len must be >= 0. Use 0 for full-episode context.")
+    if args.sac_chunk_steps <= 0:
+        raise ValueError("--sac_chunk_steps must be positive.")
+    if args.sac_episode_batch_size == 0:
+        # 0 means infer from the legacy sac_batch_size and chunk length.
+        args.sac_episode_batch_size = max(1, int(args.sac_batch_size) // int(args.sac_chunk_steps))
+    if args.sac_episode_batch_size < 0:
+        raise ValueError("--sac_episode_batch_size must be positive, or 0 to infer from --sac_batch_size.")
 
     return args

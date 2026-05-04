@@ -19,6 +19,7 @@ csv_outputs/ttt_ecet_ML1_state_proj_twolayer_seed1/ttt_ecet_policy.pth
 csv_outputs/ttt_ecet_ML1_stateproj_seed1/metrics.csv
 csv_outputs/ttt_ecet_ML1_twolayer_seed1/metrics.csv
 csv_outputs/ttt_ecet_ML1_twolayer_seed1/ttt_ecet_policy.pth
+csv_outputs/
 .vscode/settings.json
 clean_code.zip
 runs.txt
@@ -59,3 +60,14 @@ csv_outputs/stateproj-largechunk_run000/config.json
 csv_outputs/stateproj-largechunk_run000/eval_episode_success.csv
 csv_outputs/stateproj-largechunk_run000/metrics.csv
 csv_outputs/stateproj-largechunk_run000/ttt_ecet_policy.pth
+__pycache__/agent.cpython-313.pyc
+__pycache__/arguments.cpython-313.pyc
+__pycache__/sac_meta.cpython-313.pyc
+__pycache__/train.cpython-313.pyc
+__pycache__/ttt.cpython-313.pyc
+__pycache__/utils.cpython-313.pyc
+csv_outputs/eval_len_25_anysuccess.png
+csv_outputs/nostateproj_ML10_run000/config.json
+csv_outputs/nostateproj_ML10_run000/eval_episode_success.csv
+csv_outputs/nostateproj_ML10_run000/metrics.csv
+csv_outputs/nostateproj_ML10_run000/ttt_ecet_policy.pth
