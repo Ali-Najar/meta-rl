@@ -340,18 +340,124 @@ def _sample_previous_episodes(ep_idx, sample_count, device, mode="uniform"):
     return [int(x.item()) for x in sampled]
 
 
-def _train_ppo_random(model, optimizer, rollouts, args, device):
-    """Original random/full-trial PPO update mode."""
-    if len(rollouts) == 7:
+def _unpack_ppo_rollouts(rollouts, b_adv_ref=None):
+    """Unpack PPO rollout tuple with optional valid mask and task-class ids.
+
+    Supported forms:
+      6: (inputs, states, actions, old_log_probs, adv, returns)
+      7: above + b_valid
+      8: above + b_valid + b_task_ids
+
+    b_task_ids is shape (B,) and is used only when
+    --normalize_advantage_by_class is enabled.
+    """
+    if len(rollouts) == 8:
+        b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns, b_valid, b_task_ids = rollouts
+    elif len(rollouts) == 7:
         b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns, b_valid = rollouts
-    else:
+        b_task_ids = None
+    elif len(rollouts) == 6:
         b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns = rollouts
         b_valid = torch.ones_like(b_adv)
+        b_task_ids = None
+    else:
+        raise ValueError(f"Expected PPO rollouts tuple length 6, 7, or 8, got {len(rollouts)}")
+    return b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns, b_valid, b_task_ids
 
+
+def _normalize_advantages_tensor(b_adv, b_valid, b_task_ids=None, by_class=False, device=None):
+    """Normalize an advantage tensor over valid positions.
+
+    Args:
+        b_adv: (... usually B,E,T) advantage tensor.
+        b_valid: same shape as b_adv; >0 marks valid rollout positions.
+        b_task_ids: optional shape (B,) task-class ids for the first dimension.
+        by_class: if True, normalize separately for each task id.
+    """
     valid = b_valid > 0.0
-    adv_mean = b_adv[valid].mean()
-    adv_std = b_adv[valid].std()
-    b_adv = (b_adv - adv_mean) / (adv_std + 1e-8)
+    if not valid.any():
+        return b_adv
+
+    if not by_class:
+        adv_mean = b_adv[valid].mean()
+        # unbiased=False avoids NaN when the selected minibatch has one valid item.
+        adv_std = b_adv[valid].std(unbiased=False)
+        return (b_adv - adv_mean) / (adv_std + 1e-8)
+
+    if b_task_ids is None:
+        raise ValueError(
+            "Per-class advantage normalization requires task class ids in the PPO rollout tuple. "
+            "Pass (b_inputs, b_states, b_actions, b_logprobs, b_adv, b_returns, b_valid, b_task_ids)."
+        )
+
+    if not torch.is_tensor(b_task_ids):
+        b_task_ids = torch.as_tensor(b_task_ids, device=device, dtype=torch.long)
+    else:
+        b_task_ids = b_task_ids.to(device=device, dtype=torch.long)
+
+    if b_task_ids.ndim != 1 or b_task_ids.shape[0] != b_adv.shape[0]:
+        raise ValueError(
+            f"b_task_ids must have shape (B,), got {tuple(b_task_ids.shape)} "
+            f"for b_adv shape {tuple(b_adv.shape)}"
+        )
+
+    b_adv_norm = b_adv.clone()
+    for task_id in torch.unique(b_task_ids):
+        env_mask = b_task_ids == task_id
+        class_mask = valid & env_mask[:, None, None]
+        if not class_mask.any():
+            continue
+        class_adv = b_adv[class_mask]
+        class_mean = class_adv.mean()
+        class_std = class_adv.std(unbiased=False)
+        b_adv_norm[class_mask] = (b_adv[class_mask] - class_mean) / (class_std + 1e-8)
+
+    return b_adv_norm
+
+
+def _normalize_ppo_advantages(b_adv, b_valid, b_task_ids, args, device):
+    """Normalize advantages once over the whole rollout unless minibatch mode is enabled."""
+    if getattr(args, "normalize_advantage_by_minibatch_envs", False):
+        # Minibatch-env normalization is applied after env_idx is sampled inside
+        # each PPO epoch, so keep rollout advantages raw here.
+        return b_adv
+    return _normalize_advantages_tensor(
+        b_adv,
+        b_valid,
+        b_task_ids=b_task_ids,
+        by_class=getattr(args, "normalize_advantage_by_class", False),
+        device=device,
+    )
+
+
+def _normalize_minibatch_env_advantages(b_adv_mb, b_valid_mb, b_task_ids_mb, args, device):
+    """Normalize advantages inside one selected ppo_minibatch_envs batch."""
+    if not getattr(args, "normalize_advantage_by_minibatch_envs", False):
+        return b_adv_mb
+    return _normalize_advantages_tensor(
+        b_adv_mb,
+        b_valid_mb,
+        b_task_ids=b_task_ids_mb,
+        by_class=getattr(args, "normalize_advantage_by_class", False),
+        device=device,
+    )
+
+
+def _concat_episode_prefix_local(x, ep_idx, step_end):
+    """Return (mb_envs, ep_idx*T + step_end, ...) from an already-selected env batch."""
+    parts = []
+    mb = x.shape[0]
+    trailing_shape = x.shape[3:]
+    if ep_idx > 0:
+        parts.append(x[:, :ep_idx].reshape(mb, ep_idx * x.shape[2], *trailing_shape))
+    parts.append(x[:, ep_idx, :step_end])
+    return torch.cat(parts, dim=1)
+
+
+def _train_ppo_random(model, optimizer, rollouts, args, device):
+    """Original random/full-trial PPO update mode."""
+    b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns, b_valid, b_task_ids = _unpack_ppo_rollouts(rollouts)
+    b_adv = _normalize_ppo_advantages(b_adv, b_valid, b_task_ids, args, device)
 
     num_envs = b_adv.shape[0]
     mb_envs = getattr(args, "ppo_minibatch_envs", 0) or num_envs
@@ -369,6 +475,14 @@ def _train_ppo_random(model, optimizer, rollouts, args, device):
         env_perm = torch.randperm(num_envs, device=device)
         for start_idx in range(0, num_envs, mb_envs):
             env_idx = env_perm[start_idx : start_idx + mb_envs]
+            b_task_ids_mb = None if b_task_ids is None else b_task_ids[env_idx]
+            b_adv_mb = _normalize_minibatch_env_advantages(
+                b_adv[env_idx],
+                b_valid[env_idx],
+                b_task_ids_mb,
+                args,
+                device,
+            )
             local_valid = b_valid[env_idx].reshape(-1) > 0.0
             local_indices = torch.nonzero(local_valid, as_tuple=False).squeeze(-1)
             if local_indices.numel() == 0:
@@ -390,7 +504,7 @@ def _train_ppo_random(model, optimizer, rollouts, args, device):
                 values_flat = values.reshape(-1)
                 actions_flat = b_actions[env_idx].reshape(-1, action_dim)
                 old_flat = b_old_log_probs[env_idx].reshape(-1)
-                adv_flat = b_adv[env_idx].reshape(-1)
+                adv_flat = b_adv_mb.reshape(-1)
                 returns_flat = b_returns[env_idx].reshape(-1)
 
                 dist = torch.distributions.Normal(mean_flat[trans_idx], log_std_flat[trans_idx].exp())
@@ -435,16 +549,8 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
       >0 samples that many previous episodes as context plus the current episode.
       This is supported with aggregator_type='mean', 'ema', or 'attn' and loss_scope='chunk'.
     """
-    if len(rollouts) == 7:
-        b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns, b_valid = rollouts
-    else:
-        b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns = rollouts
-        b_valid = torch.ones_like(b_adv)
-
-    valid = b_valid > 0.0
-    adv_mean = b_adv[valid].mean()
-    adv_std = b_adv[valid].std()
-    b_adv = (b_adv - adv_mean) / (adv_std + 1e-8)
+    b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns, b_valid, b_task_ids = _unpack_ppo_rollouts(rollouts)
+    b_adv = _normalize_ppo_advantages(b_adv, b_valid, b_task_ids, args, device)
 
     num_envs, num_eps, ep_len = b_adv.shape
     mb_envs = getattr(args, "ppo_minibatch_envs", 0) or num_envs
@@ -476,6 +582,14 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
         env_perm = torch.randperm(num_envs, device=device)
         for start_idx in range(0, num_envs, mb_envs):
             env_idx = env_perm[start_idx : start_idx + mb_envs]
+            b_task_ids_mb = None if b_task_ids is None else b_task_ids[env_idx]
+            b_adv_mb = _normalize_minibatch_env_advantages(
+                b_adv[env_idx],
+                b_valid[env_idx],
+                b_task_ids_mb,
+                args,
+                device,
+            )
             use_detached_context = (
                 detach_context
                 and getattr(model, "aggregator_type", None) in ["mean", "ema", "attn"]
@@ -514,7 +628,7 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
                         offset = getattr(outputs, "time_offset", 0)
                         actions_seq = b_actions[env_idx, ep_idx, offset:step_end]
                         old_seq = b_old_log_probs[env_idx, ep_idx, offset:step_end]
-                        adv_seq = b_adv[env_idx, ep_idx, offset:step_end]
+                        adv_seq = b_adv_mb[:, ep_idx, offset:step_end]
                         returns_seq = b_returns[env_idx, ep_idx, offset:step_end]
                         if loss_scope == "chunk":
                             pos_start = max(step_start, offset) - offset
@@ -543,7 +657,7 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
                         if context_indices is None and not windowed_current_only:
                             actions_seq = _concat_episode_prefix(b_actions, env_idx, ep_idx, step_end)
                             old_seq = _concat_episode_prefix(b_old_log_probs[..., None], env_idx, ep_idx, step_end).squeeze(-1)
-                            adv_seq = _concat_episode_prefix(b_adv[..., None], env_idx, ep_idx, step_end).squeeze(-1)
+                            adv_seq = _concat_episode_prefix_local(b_adv_mb[..., None], ep_idx, step_end).squeeze(-1)
                             returns_seq = _concat_episode_prefix(b_returns[..., None], env_idx, ep_idx, step_end).squeeze(-1)
 
                             if loss_scope == "chunk":
@@ -558,7 +672,7 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
                             # are context only.
                             actions_seq = b_actions[env_idx, ep_idx, offset:step_end]
                             old_seq = b_old_log_probs[env_idx, ep_idx, offset:step_end]
-                            adv_seq = b_adv[env_idx, ep_idx, offset:step_end]
+                            adv_seq = b_adv_mb[:, ep_idx, offset:step_end]
                             returns_seq = b_returns[env_idx, ep_idx, offset:step_end]
                             if loss_scope == "chunk":
                                 pos_start = max(step_start, offset) - offset

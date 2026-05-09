@@ -181,6 +181,25 @@ def get_args():
     parser.add_argument("--ppo_minibatch_steps", type=int, default=0, help=("Number of random transition positions per PPO optimizer step inside selected env trials. Use 0 to train on all selected trial steps at once."))
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
+    parser.add_argument(
+        "--normalize_advantage_by_class",
+        action="store_true",
+        help=(
+            "Normalize PPO advantages separately within each sampled task class instead of "
+            "using one global rollout mean/std. Uses trainer-known task-class labels only "
+            "for loss scaling; labels are not fed to the policy."
+        ),
+    )
+    parser.add_argument(
+        "--normalize_advantage_by_minibatch_envs",
+        action="store_true",
+        help=(
+            "Normalize PPO advantages separately inside each selected ppo_minibatch_envs "
+            "environment batch, instead of once over the whole rollout. If "
+            "--normalize_advantage_by_class is also set, normalization is done per task "
+            "class within each minibatch-env batch."
+        ),
+    )
     parser.add_argument("--clip_epsilon", type=float, default=0.2)
     parser.add_argument("--ent_coef", type=float, default=0.0)
     parser.add_argument("--vf_coef", type=float, default=0.5)

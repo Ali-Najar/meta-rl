@@ -54,7 +54,7 @@ def apply_moving_average(series: pd.Series, window: int | None):
 def plot_metric(runs, root: Path, metric: str, title: str, moving_average_window: int | None = None):
     plt.figure(figsize=(10, 6))
     ax = plt.gca()
-    ax.set_prop_cycle(cycler(color=COLORBLIND_COLORS) * cycler(linestyle=LINESTYLES))
+    ax.set_prop_cycle(cycler(linestyle=LINESTYLES) * cycler(color=COLORBLIND_COLORS))
 
     plotted = False
     for run_name, (df, x_col) in runs.items():

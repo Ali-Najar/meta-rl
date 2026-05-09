@@ -566,6 +566,7 @@ def train():
     )
 
     train_class_names = list(meta_learning.train_classes.keys())
+    task_class_to_id = {name: idx for idx, name in enumerate(sorted(train_class_names))}
     task_assignment_rng = np.random.default_rng(args.seed + 12345)
 
     obs_dim = envs.single_observation_space.shape[0]
@@ -731,6 +732,12 @@ def train():
         b_rewards = torch.zeros((B, E, T), device=device)
         b_dones = torch.zeros((B, E, T), device=device)
         b_values = torch.zeros((B, E, T), device=device)
+        b_valid = torch.zeros((B, E, T), device=device)
+        b_task_ids = torch.tensor(
+            [task_class_to_id[name] for name in assigned_classes],
+            dtype=torch.long,
+            device=device,
+        )
 
         episode_memory = model.init_episode_memory(B, device=device)
 
@@ -791,6 +798,7 @@ def train():
                 b_rewards[:, ep, step] = torch.tensor(norm_reward, dtype=torch.float32, device=device)
                 b_dones[:, ep, step] = torch.tensor(done, dtype=torch.float32, device=device)
                 b_values[:, ep, step] = value
+                b_valid[:, ep, step] = 1.0
 
                 cache_params = out.cache_params
                 prev_action = action_np
@@ -827,20 +835,17 @@ def train():
             args.gae_lambda,
         )
 
-        #################################################################################
-        # Diagnostic: check whether global advantage normalization would shrink
-        # some task classes relative to others.
-        print_advantage_diagnostics_by_class(
-            b_adv=b_adv,
-            assigned_classes=assigned_classes,
-            update=update + 1,
-            ppo_epoch=None,
-            prefix="ADV_DIAG_PRE_PPO",
-        )
-        #################################################################################
-
         ppo_t0 = time.time()
-        rollouts = (b_inputs, b_states, b_actions, b_logprobs, b_adv, b_returns)
+        rollouts = (
+            b_inputs,
+            b_states,
+            b_actions,
+            b_logprobs,
+            b_adv,
+            b_returns,
+            b_valid,
+            b_task_ids,
+        )
         loss, p_loss, v_loss, ent = train_ppo(model, optimizer, rollouts, args, device)
         ppo_time = time.time() - ppo_t0
 
