@@ -29,16 +29,15 @@ def parse_int_list(value):
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="TTT-ECET-style PPO Training")
+    parser = argparse.ArgumentParser(description="TTT-ECET PPO Training")
 
     parser.add_argument("--task_set", type=str, default="ML1", choices=["ML1", "ML10", "ML45"])
     parser.add_argument("--env_name", type=str, default="push-v3")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--num_envs", type=int, default=50, help="Number of parallel environments to run during training.")
+    parser.add_argument("--num_envs", type=int, default=50, help="Number of parallel environments during training.")
     parser.add_argument("--trial_length", type=int, default=1, help="Episodes per trial and episode-memory slots.")
     parser.add_argument("--rollout_steps", type=int, default=500, help="Steps per episode.")
-    parser.add_argument("--random_task_sample", action="store_true")
-
+    parser.add_argument("--random_task_sample", action="store_true", help="Sample training task classes independently instead of balancing per update.")
 
     parser.add_argument("--agent_mode", type=str, default="agent_rl2", choices=["agent_v1", "agent_v2", "agent_rl2"])
     parser.add_argument("--hidden_size", type=int, default=256)
@@ -48,52 +47,17 @@ def get_args():
     parser.add_argument("--ttt_layer_type", type=str, default="mlp", choices=["linear", "mlp"])
 
     parser.add_argument(
-        "--context_seq_len",
-        type=int,
-        default=0,
-        help=(
-            "TTT context window length per episode. Use 0 to encode the whole episode/prefix. "
-            "If >0, sampled training contexts use a context_seq_len transition window. "
-            "SAC rollout/eval always uses cached full-prefix context and does not recompute "
-            "windows."
-        ),
-    )
-    parser.add_argument(
-        "--prev_context_window_mode",
-        type=str,
-        default="last",
-        choices=["last", "random"],
-        help=(
-            "How to choose the context_seq_len window for previous completed episodes during "
-            "training-time context reconstruction. last = use the final window of each previous "
-            "episode; random = sample a random contiguous window from each previous episode. "
-            "SAC rollout/eval previous-episode memory remains the observed final episode "
-            "embedding."
-        ),
-    )
-    parser.add_argument(
         "--context_episode_sample_mode",
         type=str,
         default="uniform",
         choices=["uniform", "recent", "last"],
         help=(
             "How to choose previous episodes when --ppo_context_episode_sample > 0. "
-            "uniform = random previous episodes; recent = sample previous episodes with "
-            "higher probability for newer episodes; last = use the most recent K previous episodes. "
-            "Sampled episode indices are sorted chronologically before aggregation."
-        ),
-    )
-    parser.add_argument(
-        "--no_rollout_context_seq_len",
-        action="store_true",
-        help=(
-            "If set, ignore --context_seq_len during PPO rollout/eval collection. "
-            "Rollout/eval will use cached full-prefix TTT state, while PPO update code "
-            "can still use --context_seq_len for sequential/windowed training."
+            "uniform = random previous episodes; recent = higher probability for newer episodes; "
+            "last = use the most recent K previous episodes. Sampled indices are sorted chronologically."
         ),
     )
 
-    # Ablation knobs for the ECET-style additions.
     parser.add_argument(
         "--policy_hidden_sizes",
         type=parse_hidden_sizes,
@@ -109,56 +73,24 @@ def get_args():
     parser.add_argument(
         "--aggregator_type",
         type=str,
-        default="mean",
-        choices=["concat", "mean", "ema", "attn"],
+        default="ema",
+        choices=["ema", "attn"],
         help=(
-            "concat = current slot-specific linear aggregator; "
-            "mean = average previous episode finals plus current TTT output; "
-            "ema = recency-weighted exponential moving average over previous episode finals; "
-            "attn = current-hidden query attention over previous episode finals plus current hidden."
+            "ema = recency-weighted EMA over previous episode finals plus current hidden; "
+            "attn = current-hidden query attention over previous episode finals."
         ),
     )
     parser.add_argument(
         "--ema_beta",
         type=float,
         default=0.7,
-        help=(
-            "EMA decay for --aggregator_type ema. Higher values keep longer memory; "
-            "lower values weight newer episodes/current hidden more strongly."
-        ),
+        help="EMA decay for --aggregator_type ema. Higher values keep longer memory.",
     )
     parser.add_argument(
         "--episode_attn_heads",
         type=int,
         default=1,
-        help=(
-            "Number of attention heads for --aggregator_type attn. The current hidden "
-            "state is the query; previous episode finals plus current hidden are keys/values."
-        ),
-    )
-    parser.add_argument(
-        "--use_context_gate",
-        action="store_true",
-        help=(
-            "Add a small MLP gate after the episode aggregator. The gate sees "
-            "[aggregated_context, current_hidden], applies sigmoid, and mixes "
-            "gate * aggregated_context + (1 - gate) * current_hidden."
-        ),
-    )
-    parser.add_argument(
-        "--context_gate_hidden_sizes",
-        type=parse_hidden_sizes,
-        default=(64,),
-        help="Comma-separated hidden sizes for the context gate MLP. Use 0/none for a linear gate.",
-    )
-    parser.add_argument(
-        "--context_gate_init_bias",
-        type=float,
-        default=2.0,
-        help=(
-            "Initial bias for the context gate sigmoid logit. With the default mixer, "
-            "2.0 starts near sigmoid(2)=0.88, i.e. mostly the existing aggregate."
-        ),
+        help="Number of attention heads for --aggregator_type attn.",
     )
     parser.add_argument(
         "--no_state_proj",
@@ -167,37 +99,24 @@ def get_args():
         help="Disable ECET-style current-state projection concatenated into the policy/value heads.",
     )
     parser.set_defaults(use_state_proj=True)
-    parser.add_argument(
-        "--init_type",
-        type=str,
-        default="ppo",
-        choices=["xavier", "ppo"],
-        help="xavier = current MLP Xavier init; ppo = PPO-style orthogonal init for non-TTT policy stack.",
-    )
 
     parser.add_argument("--num_updates", type=int, default=1000)
     parser.add_argument("--ppo_epochs", type=int, default=30)
     parser.add_argument("--ppo_minibatch_envs", type=int, default=30, help="Number of trials/envs per PPO minibatch.")
-    parser.add_argument("--ppo_minibatch_steps", type=int, default=0, help=("Number of random transition positions per PPO optimizer step inside selected env trials. Use 0 to train on all selected trial steps at once."))
+    parser.add_argument(
+        "--ppo_minibatch_steps",
+        type=int,
+        default=0,
+        help="Number of ordered timesteps per PPO optimizer step. Use 0 to train on the whole episode chunk.",
+    )
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument(
         "--normalize_advantage_by_class",
         action="store_true",
         help=(
-            "Normalize PPO advantages separately within each sampled task class instead of "
-            "using one global rollout mean/std. Uses trainer-known task-class labels only "
-            "for loss scaling; labels are not fed to the policy."
-        ),
-    )
-    parser.add_argument(
-        "--normalize_advantage_by_minibatch_envs",
-        action="store_true",
-        help=(
-            "Normalize PPO advantages separately inside each selected ppo_minibatch_envs "
-            "environment batch, instead of once over the whole rollout. If "
-            "--normalize_advantage_by_class is also set, normalization is done per task "
-            "class within each minibatch-env batch."
+            "Normalize PPO advantages separately within each sampled task class instead of using one global "
+            "rollout mean/std. Labels are used only for loss scaling, not as policy inputs."
         ),
     )
     parser.add_argument("--clip_epsilon", type=float, default=0.2)
@@ -208,155 +127,36 @@ def get_args():
     parser.add_argument("--min_std", type=float, default=0.1)
     parser.add_argument("--max_std", type=float, default=1.5)
     parser.add_argument("--init_std", type=float, default=0.5)
-    parser.add_argument("--lr_decay", action="store_true")
-    parser.add_argument("--lr_decay_start", type=float, default=0.0)
-    parser.add_argument("--lr_end_factor", type=float, default=0.05)
 
     parser.add_argument("--eval_interval", type=int, default=5, help="Evaluate every N updates.")
-    parser.add_argument("--eval_num_tasks", type=int, default=25, help="Sample this many eval variations, not all variations.")
+    parser.add_argument("--eval_num_tasks", type=int, default=25, help="Sample this many eval variations.")
     parser.add_argument("--eval_num_trials", type=int, default=1, help="Number of evaluation trials per vectorized eval worker.")
     parser.add_argument(
         "--eval_trial_length",
         type=int,
         default=None,
-        help=(
-            "Number of episodes to run per evaluation trial. If omitted, uses --trial_length. "
-            "This can be larger than training trial_length when aggregator_type=mean, ema, or attn."
-        ),
+        help="Number of episodes to run per evaluation trial. If omitted, uses --trial_length.",
     )
     parser.add_argument(
         "--eval_report_lengths",
         type=parse_int_list,
         default=None,
-        help=(
-            "Comma-separated prefix lengths to summarize from one eval rollout, e.g. 5,25. "
-            "Evaluation runs once for --eval_trial_length episodes, then reports metrics for these prefixes."
-        ),
+        help="Comma-separated prefix lengths to summarize from one eval rollout, e.g. 5,25.",
     )
     parser.add_argument("--comment", type=str, default="")
 
-    # Run/output management.
     parser.add_argument("--run_root", type=str, default="csv_outputs", help="Root directory for numbered run folders.")
-    parser.add_argument("--run_name", type=str, default="", help="Optional base name for this run. If empty, a name is built from key args.")
+    parser.add_argument("--run_name", type=str, default="", help="Optional base name for this run.")
 
-    # PPO update strategy.
-    parser.add_argument(
-        "--ppo_update_mode",
-        type=str,
-        default="random",
-        choices=["random", "sequential"],
-        help=(
-            "random = old random transition chunking; sequential = chronological chunks, "
-            "forwarding only the prefix needed for the current chunk."
-        ),
-    )
-    parser.add_argument(
-        "--ppo_sequential_loss_scope",
-        type=str,
-        default="chunk",
-        choices=["chunk", "prefix"],
-        help=(
-            "For --ppo_update_mode sequential: chunk = loss only on the current ordered chunk; "
-            "prefix = loss on all transitions from the start of the trial through the current chunk."
-        ),
-    )
     parser.add_argument(
         "--ppo_context_episode_sample",
         type=int,
         default=0,
         help=(
-            "For sequential PPO with aggregator_type=mean/ema/attn only: if >0, sample this many previous "
-            "episodes as context plus the current episode, instead of forwarding all previous episodes. "
-            "Use 0 to use all previous episodes."
+            "If >0, sample this many previous episodes as context for a current chunk instead of "
+            "forwarding all previous episodes. Use 0 to use all previous episodes."
         ),
     )
-
-    parser.add_argument(
-        "--detach_context_episodes",
-        action="store_true",
-        help=(
-            "For sequential PPO with aggregator_type=mean/ema/attn: encode previous episode final "
-            "embeddings once with no_grad/detach for each env minibatch and reuse them "
-            "across current-episode chunks. This saves PPO compute but uses stale, "
-            "stop-gradient previous-episode context. Rollout is unchanged."
-        ),
-    )
-
-
-    # Online SAC replacement for PPO. Used by train_sac.py.
-    parser.add_argument("--sac_replay_size", type=int, default=100, help="Replay capacity in stored vectorized trial batches.")
-    parser.add_argument(
-        "--sac_batch_size",
-        type=int,
-        default=256,
-        help=(
-            "Legacy transition-batch size. Chunked SAC now uses "
-            "--sac_episode_batch_size * --sac_chunk_steps as the effective "
-            "transition batch size. If --sac_episode_batch_size <= 0, this "
-            "value is used to infer the episode batch size."
-        ),
-    )
-    parser.add_argument(
-        "--sac_episode_batch_size",
-        type=int,
-        default=16,
-        help=(
-            "Number of sampled episodes/chunks per SAC or forecasting update. "
-            "TTT current context is encoded once over each extended episode chunk."
-        ),
-    )
-    parser.add_argument(
-        "--sac_chunk_steps",
-        type=int,
-        default=16,
-        help=(
-            "Number of consecutive timesteps per sampled episode chunk. The current "
-            "episode is encoded through the whole chunk, then the corresponding "
-            "per-timestep contexts are gathered. The effective transition batch size "
-            "is sac_episode_batch_size * sac_chunk_steps."
-        ),
-    )
-    parser.add_argument("--sac_updates_per_rollout", type=int, default=100, help="SAC actor/critic gradient steps after each rollout batch.")
-    parser.add_argument(
-        "--sac_train_epochs",
-        type=int,
-        default=1,
-        help=(
-            "Number of times to repeat the block: TTT forecasting updates, then SAC actor/critic updates, "
-            "after each rollout batch. Total SAC steps per outer update = "
-            "sac_train_epochs * sac_updates_per_rollout."
-        ),
-    )
-    parser.add_argument("--sac_forecast_epochs", type=int, default=10, help="TTT+forecaster updates before SAC updates inside each SAC train epoch.")
-    parser.add_argument(
-        "--sac_initial_forecast_epochs",
-        type=int,
-        default=-1,
-        help=(
-            "Extra TTT+forecaster-only updates run once after the first collected "
-            "rollout and before the normal SAC training block. Use -1 for "
-            "5 * sac_forecast_epochs, or 0 to disable."
-        ),
-    )
-    parser.add_argument("--sac_forecast_horizon", type=int, default=5, help="K-step open-loop forecasting horizon.")
-    parser.add_argument("--sac_forecast_obs_coef", type=float, default=1.0)
-    parser.add_argument("--sac_forecast_reward_coef", type=float, default=1.0)
-    parser.add_argument("--sac_actor_lr", type=float, default=3e-4)
-    parser.add_argument("--sac_critic_lr", type=float, default=3e-4)
-    parser.add_argument("--sac_context_lr", type=float, default=3e-4)
-    parser.add_argument("--sac_alpha", type=float, default=0.2, help="Fixed SAC entropy temperature.")
-    parser.add_argument("--sac_tau", type=float, default=0.005, help="Target critic Polyak update coefficient.")
-    parser.add_argument("--sac_reward_scale", type=float, default=1.0)
-    parser.add_argument(
-        "--sac_random_steps",
-        type=int,
-        default=5000,
-        help="Use random actions until this many env steps are collected.",
-    )
-    parser.add_argument("--sac_context_episode_sample", type=int, default=0, help="Previous episodes sampled as context for SAC/forecast. 0 means all previous episodes.")
-    parser.add_argument("--sac_detach_previous_context", action="store_true", help="Stop gradients through previous episode context windows during SAC/forecast.")
-    parser.add_argument("--sac_update_ttt_with_sac", action="store_true", help="Allow SAC actor/critic losses to update TTT context. Default: TTT only updated by forecasting.")
-    parser.add_argument("--sac_hidden_sizes", type=parse_hidden_sizes, default=(256, 256), help="Actor/critic/forecaster hidden sizes, e.g. 256,256.")
 
     args = parser.parse_args()
 
@@ -382,19 +182,11 @@ def get_args():
             f"eval_trial_length={args.eval_trial_length}. Increase --eval_trial_length."
         )
 
-    if args.context_seq_len is None:
-        args.context_seq_len = 0
-
     if not (0.0 <= args.ema_beta <= 1.0):
         raise ValueError("--ema_beta must be between 0 and 1 inclusive.")
-    if args.context_seq_len < 0:
-        raise ValueError("--context_seq_len must be >= 0. Use 0 for full-episode context.")
-    if args.sac_chunk_steps <= 0:
-        raise ValueError("--sac_chunk_steps must be positive.")
-    if args.sac_episode_batch_size == 0:
-        # 0 means infer from the legacy sac_batch_size and chunk length.
-        args.sac_episode_batch_size = max(1, int(args.sac_batch_size) // int(args.sac_chunk_steps))
-    if args.sac_episode_batch_size < 0:
-        raise ValueError("--sac_episode_batch_size must be positive, or 0 to infer from --sac_batch_size.")
+    if args.episode_attn_heads <= 0:
+        raise ValueError("--episode_attn_heads must be positive.")
+    if args.ppo_context_episode_sample < 0:
+        raise ValueError("--ppo_context_episode_sample must be non-negative.")
 
     return args
