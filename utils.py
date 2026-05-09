@@ -433,7 +433,7 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
 
     ppo_context_episode_sample:
       >0 samples that many previous episodes as context plus the current episode.
-      This is supported with aggregator_type='mean' or 'ema' and loss_scope='chunk'.
+      This is supported with aggregator_type='mean', 'ema', or 'attn' and loss_scope='chunk'.
     """
     if len(rollouts) == 7:
         b_inputs, b_states, b_actions, b_old_log_probs, b_adv, b_returns, b_valid = rollouts
@@ -455,8 +455,8 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
     context_sample = getattr(args, "ppo_context_episode_sample", 0)
     detach_context = getattr(args, "detach_context_episodes", False)
 
-    if context_sample and getattr(model, "aggregator_type", None) not in ["mean", "ema"]:
-        raise ValueError("--ppo_context_episode_sample requires --aggregator_type mean or ema")
+    if context_sample and getattr(model, "aggregator_type", None) not in ["mean", "ema", "attn"]:
+        raise ValueError("--ppo_context_episode_sample requires --aggregator_type mean, ema, or attn")
     if context_sample and loss_scope != "chunk":
         warnings.warn(
             "--ppo_context_episode_sample with --ppo_sequential_loss_scope=prefix "
@@ -478,7 +478,7 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
             env_idx = env_perm[start_idx : start_idx + mb_envs]
             use_detached_context = (
                 detach_context
-                and getattr(model, "aggregator_type", None) in ["mean", "ema"]
+                and getattr(model, "aggregator_type", None) in ["mean", "ema", "attn"]
                 and getattr(args, "ppo_update_mode", "random") == "sequential"
             )
             context_finals = None
@@ -604,3 +604,5 @@ def train_ppo(model, optimizer, rollouts, args, device):
     if mode == "sequential":
         return _train_ppo_sequential(model, optimizer, rollouts, args, device)
     raise ValueError("ppo_update_mode must be 'random' or 'sequential'")
+
+

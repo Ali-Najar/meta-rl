@@ -37,6 +37,8 @@ def get_args():
     parser.add_argument("--num_envs", type=int, default=50, help="Number of parallel environments to run during training.")
     parser.add_argument("--trial_length", type=int, default=1, help="Episodes per trial and episode-memory slots.")
     parser.add_argument("--rollout_steps", type=int, default=500, help="Steps per episode.")
+    parser.add_argument("--random_task_sample", action="store_true")
+
 
     parser.add_argument("--agent_mode", type=str, default="agent_rl2", choices=["agent_v1", "agent_v2", "agent_rl2"])
     parser.add_argument("--hidden_size", type=int, default=256)
@@ -81,6 +83,15 @@ def get_args():
             "Sampled episode indices are sorted chronologically before aggregation."
         ),
     )
+    parser.add_argument(
+        "--no_rollout_context_seq_len",
+        action="store_true",
+        help=(
+            "If set, ignore --context_seq_len during PPO rollout/eval collection. "
+            "Rollout/eval will use cached full-prefix TTT state, while PPO update code "
+            "can still use --context_seq_len for sequential/windowed training."
+        ),
+    )
 
     # Ablation knobs for the ECET-style additions.
     parser.add_argument(
@@ -99,11 +110,12 @@ def get_args():
         "--aggregator_type",
         type=str,
         default="mean",
-        choices=["concat", "mean", "ema"],
+        choices=["concat", "mean", "ema", "attn"],
         help=(
             "concat = current slot-specific linear aggregator; "
             "mean = average previous episode finals plus current TTT output; "
-            "ema = recency-weighted exponential moving average over previous episode finals."
+            "ema = recency-weighted exponential moving average over previous episode finals; "
+            "attn = current-hidden query attention over previous episode finals plus current hidden."
         ),
     )
     parser.add_argument(
@@ -113,6 +125,39 @@ def get_args():
         help=(
             "EMA decay for --aggregator_type ema. Higher values keep longer memory; "
             "lower values weight newer episodes/current hidden more strongly."
+        ),
+    )
+    parser.add_argument(
+        "--episode_attn_heads",
+        type=int,
+        default=1,
+        help=(
+            "Number of attention heads for --aggregator_type attn. The current hidden "
+            "state is the query; previous episode finals plus current hidden are keys/values."
+        ),
+    )
+    parser.add_argument(
+        "--use_context_gate",
+        action="store_true",
+        help=(
+            "Add a small MLP gate after the episode aggregator. The gate sees "
+            "[aggregated_context, current_hidden], applies sigmoid, and mixes "
+            "gate * aggregated_context + (1 - gate) * current_hidden."
+        ),
+    )
+    parser.add_argument(
+        "--context_gate_hidden_sizes",
+        type=parse_hidden_sizes,
+        default=(64,),
+        help="Comma-separated hidden sizes for the context gate MLP. Use 0/none for a linear gate.",
+    )
+    parser.add_argument(
+        "--context_gate_init_bias",
+        type=float,
+        default=2.0,
+        help=(
+            "Initial bias for the context gate sigmoid logit. With the default mixer, "
+            "2.0 starts near sigmoid(2)=0.88, i.e. mostly the existing aggregate."
         ),
     )
     parser.add_argument(
@@ -140,7 +185,7 @@ def get_args():
     parser.add_argument("--ent_coef", type=float, default=0.0)
     parser.add_argument("--vf_coef", type=float, default=0.5)
     parser.add_argument("--max_grad_norm", type=float, default=10.0)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--min_std", type=float, default=0.1)
     parser.add_argument("--max_std", type=float, default=1.5)
     parser.add_argument("--init_std", type=float, default=0.5)
@@ -157,7 +202,7 @@ def get_args():
         default=None,
         help=(
             "Number of episodes to run per evaluation trial. If omitted, uses --trial_length. "
-            "This can be larger than training trial_length when aggregator_type=mean or ema."
+            "This can be larger than training trial_length when aggregator_type=mean, ema, or attn."
         ),
     )
     parser.add_argument(
@@ -201,7 +246,7 @@ def get_args():
         type=int,
         default=0,
         help=(
-            "For sequential PPO with aggregator_type=mean/ema only: if >0, sample this many previous "
+            "For sequential PPO with aggregator_type=mean/ema/attn only: if >0, sample this many previous "
             "episodes as context plus the current episode, instead of forwarding all previous episodes. "
             "Use 0 to use all previous episodes."
         ),
@@ -211,7 +256,7 @@ def get_args():
         "--detach_context_episodes",
         action="store_true",
         help=(
-            "For sequential PPO with aggregator_type=mean/ema: encode previous episode final "
+            "For sequential PPO with aggregator_type=mean/ema/attn: encode previous episode final "
             "embeddings once with no_grad/detach for each env minibatch and reuse them "
             "across current-episode chunks. This saves PPO compute but uses stale, "
             "stop-gradient previous-episode context. Rollout is unchanged."

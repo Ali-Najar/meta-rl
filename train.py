@@ -81,9 +81,18 @@ def make_run_dir(args):
 
     return run_dir
 
-def make_sampler_env(classes, tasks, seed):
+def should_mask_goal(args):
+    """Mask goal coordinates only for ML1.
+
+    ML10 and ML45 expose goal coordinates in the observation, matching the
+    standard meta-learning benchmark setup.
+    """
+    return args.task_set == "ML1"
+
+
+def make_sampler_env(classes, tasks, seed, mask_goal=True):
     def thunk():
-        return MetaWorldTaskSamplerEnv(classes, tasks, seed=seed, mask_goal=True)
+        return MetaWorldTaskSamplerEnv(classes, tasks, seed=seed, mask_goal=mask_goal)
 
     return thunk
 
@@ -112,6 +121,43 @@ def make_balanced_class_assignment(class_names, num_envs, rng):
     rng.shuffle(assigned)
     return assigned
 
+
+
+
+def summarize_rollout_by_task_class(assigned_classes, trial_ep_rewards, trial_ep_successes):
+    """Aggregate rollout returns/successes by Meta-World task class.
+
+    assigned_classes: list[str] length B, one class name per vector env.
+    trial_ep_rewards: (B, E) raw episode returns for the collected rollout.
+    trial_ep_successes: (B, E) boolean episode success flags.
+
+    Returns a list of dictionaries sorted by task class name.
+    """
+    assigned = np.asarray(assigned_classes, dtype=object)
+    rows = []
+
+    for env_name in sorted(set(assigned_classes)):
+        mask = assigned == env_name
+        rewards = trial_ep_rewards[mask]
+        successes = trial_ep_successes[mask]
+        if rewards.shape[0] == 0:
+            continue
+
+        rows.append(
+            {
+                "env_name": env_name,
+                "num_envs": int(rewards.shape[0]),
+                "trial_return": float(rewards.sum(axis=1).mean()),
+                "final_return": float(rewards[:, -1].mean()),
+                "final_success": float(successes[:, -1].mean()),
+                "anysuccess": float(successes.any(axis=1).mean()),
+                "mean_ep_success": float(successes.mean()),
+                "episode_returns": rewards.mean(axis=0).astype(float).tolist(),
+                "episode_successes": successes.mean(axis=0).astype(float).tolist(),
+            }
+        )
+
+    return rows
 
 def build_metaworld(args):
     if args.task_set == "ML10":
@@ -145,7 +191,7 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
         )
 
     envs = gym.vector.SyncVectorEnv(
-        [make_sampler_env(classes, tasks, args.seed + 10_000 + i) for i in range(n)]
+        [make_sampler_env(classes, tasks, args.seed + 10_000 + i, mask_goal=should_mask_goal(args)) for i in range(n)]
     )
 
     action_dim = envs.single_action_space.shape[0]
@@ -193,16 +239,23 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
             ep_rewards = np.zeros(n, dtype=np.float32)
             ep_success = np.zeros(n, dtype=bool)
             cache_params = None
-            current_episode_inputs = torch.zeros((n, args.rollout_steps, model.input_dim), device=device)
+            
+            rollout_uses_context_window = (args.context_seq_len > 0 and not args.no_rollout_context_seq_len)
+            current_episode_inputs = None
+            if rollout_uses_context_window:
+                current_episode_inputs = torch.zeros(
+                    (n, args.rollout_steps, model.input_dim),
+                    device=device,
+                )
 
             for step in range(args.rollout_steps):
                 agent_input = get_agent_input(obs, prev_action, prev_reward, prev_done, args.agent_mode)
                 inp_t = torch.tensor(agent_input, dtype=torch.float32, device=device)
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-                current_episode_inputs[:, step, :] = inp_t
 
                 context_window = None
-                if args.context_seq_len > 0:
+                if rollout_uses_context_window:
+                    current_episode_inputs[:, step, :] = inp_t
                     win_start = max(0, step + 1 - args.context_seq_len)
                     context_window = current_episode_inputs[:, win_start : step + 1, :]
 
@@ -297,6 +350,93 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
 
     return summaries, detailed_rows
 
+def print_advantage_diagnostics_by_class(
+    b_adv,
+    assigned_classes,
+    update,
+    ppo_epoch=None,
+    prefix="ADV_DIAG",
+):
+    """Print raw and globally-normalized advantage stats per task class.
+
+    b_adv: torch.Tensor with shape (B, E, T)
+    assigned_classes: list[str] of length B, one task class per vector env
+    """
+    with torch.no_grad():
+        adv = b_adv.detach().float().cpu()  # (B, E, T)
+        B = adv.shape[0]
+
+        if len(assigned_classes) != B:
+            print(
+                f"{prefix} update={update}: skipped; "
+                f"len(assigned_classes)={len(assigned_classes)} but B={B}"
+            )
+            return
+
+        flat = adv.reshape(-1)
+        global_mean = flat.mean()
+        global_std = flat.std(unbiased=False).clamp_min(1e-8)
+
+        adv_norm = (adv - global_mean) / global_std
+
+        epoch_str = "" if ppo_epoch is None else f" epoch={ppo_epoch}"
+        print(
+            f"\n{prefix} update={update}{epoch_str} | "
+            f"GLOBAL raw_mean={global_mean.item():+.5f} "
+            f"raw_std={global_std.item():.5f} "
+            f"raw_abs_mean={flat.abs().mean().item():.5f}"
+        )
+
+        unique_classes = sorted(set(assigned_classes))
+        rows = []
+
+        for cls in unique_classes:
+            env_idx = [i for i, name in enumerate(assigned_classes) if name == cls]
+            cls_raw = adv[env_idx].reshape(-1)
+            cls_norm = adv_norm[env_idx].reshape(-1)
+
+            raw_mean = cls_raw.mean().item()
+            raw_std = cls_raw.std(unbiased=False).item()
+            raw_abs = cls_raw.abs().mean().item()
+
+            norm_mean = cls_norm.mean().item()
+            norm_std = cls_norm.std(unbiased=False).item()
+            norm_abs = cls_norm.abs().mean().item()
+
+            # This ratio is useful: <1 means the class has lower raw advantage
+            # scale than the global batch; >1 means it has larger scale.
+            scale_vs_global = raw_std / global_std.item()
+
+            rows.append(
+                (
+                    cls,
+                    len(env_idx),
+                    raw_mean,
+                    raw_std,
+                    raw_abs,
+                    scale_vs_global,
+                    norm_mean,
+                    norm_std,
+                    norm_abs,
+                )
+            )
+
+        print(
+            f"{'class':32s} {'n_env':>5s} "
+            f"{'raw_mean':>10s} {'raw_std':>10s} {'raw_abs':>10s} "
+            f"{'std/global':>10s} "
+            f"{'norm_mean':>10s} {'norm_std':>10s} {'norm_abs':>10s}"
+        )
+
+        for row in rows:
+            cls, n_env, raw_mean, raw_std, raw_abs, scale_vs_global, norm_mean, norm_std, norm_abs = row
+            print(
+                f"{cls:32s} {n_env:5d} "
+                f"{raw_mean:+10.4f} {raw_std:10.4f} {raw_abs:10.4f} "
+                f"{scale_vs_global:10.4f} "
+                f"{norm_mean:+10.4f} {norm_std:10.4f} {norm_abs:10.4f}"
+            )
+        print("")
 
 def train():
     args = get_args()
@@ -316,7 +456,7 @@ def train():
     if args.aggregator_type == "concat" and args.eval_trial_length != args.trial_length:
         warnings.warn(
             "--eval_trial_length different from --trial_length is only supported with "
-            "--aggregator_type=mean or ema. The concat/slot aggregator has a fixed number "
+            "--aggregator_type=mean, ema, or attn. The concat/slot aggregator has a fixed number "
             "of learned episode slots and will error if evaluated with a different length.",
             UserWarning,
         )
@@ -332,9 +472,9 @@ def train():
         )
 
     if args.ppo_context_episode_sample > 0:
-        if args.aggregator_type not in ["mean", "ema"]:
+        if args.aggregator_type not in ["mean", "ema", "attn"]:
             warnings.warn(
-                "--ppo_context_episode_sample is only supported by --aggregator_type=mean/ema. "
+                "--ppo_context_episode_sample is only supported by --aggregator_type=mean/ema/attn. "
                 "The PPO update will raise an error for concat.",
                 UserWarning,
             )
@@ -397,9 +537,9 @@ def train():
                 "It will be ignored in random PPO mode.",
                 UserWarning,
             )
-        if args.aggregator_type not in ["mean", "ema"]:
+        if args.aggregator_type not in ["mean", "ema", "attn"]:
             warnings.warn(
-                "--detach_context_episodes is only implemented for --aggregator_type=mean/ema. "
+                "--detach_context_episodes is only implemented for --aggregator_type=mean/ema/attn. "
                 "It will be ignored for the slot-specific concat/linear aggregator.",
                 UserWarning,
             )
@@ -415,7 +555,12 @@ def train():
 
     envs = gym.vector.SyncVectorEnv(
         [
-            make_sampler_env(meta_learning.train_classes, meta_learning.train_tasks, args.seed + i)
+            make_sampler_env(
+                meta_learning.train_classes,
+                meta_learning.train_tasks,
+                args.seed + i,
+                mask_goal=should_mask_goal(args),
+            )
             for i in range(args.num_envs)
         ]
     )
@@ -465,6 +610,10 @@ def train():
         init_type=args.init_type,
         context_seq_len=args.context_seq_len,
         prev_context_window_mode=args.prev_context_window_mode,
+        use_context_gate=args.use_context_gate,
+        context_gate_hidden_sizes=args.context_gate_hidden_sizes,
+        context_gate_init_bias=args.context_gate_init_bias,
+        episode_attn_heads=args.episode_attn_heads,
         min_std=args.min_std,
         max_std=args.max_std,
         init_std=args.init_std,
@@ -507,6 +656,23 @@ def train():
     with open(csv_path, "w", newline="") as f:
         csv.writer(f).writerow(metrics_header)
 
+    rollout_task_csv_path = os.path.join(out_dir, "rollout_task_class_metrics.csv")
+    rollout_task_header = [
+        "update",
+        "timestep",
+        "env_name",
+        "num_envs",
+        "trial_return",
+        "final_return",
+        "final_success",
+        "anysuccess",
+        "mean_ep_success",
+    ]
+    rollout_task_header.extend([f"episode_{ep + 1}_return" for ep in range(args.trial_length)])
+    rollout_task_header.extend([f"episode_{ep + 1}_success" for ep in range(args.trial_length)])
+    with open(rollout_task_csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(rollout_task_header)
+
     eval_episode_csv_path = os.path.join(out_dir, "eval_episode_success.csv")
     with open(eval_episode_csv_path, "w", newline="") as f:
         csv.writer(f).writerow(
@@ -535,20 +701,28 @@ def train():
     for update in range(args.num_updates):
         t0 = time.time()
 
-        assigned_classes = make_balanced_class_assignment(
-            train_class_names,
-            args.num_envs,
-            task_assignment_rng,
-        )
 
-        for env, env_name in zip(envs.envs, assigned_classes):
-            env.sample_new_task(env_name=env_name)
+        if args.random_task_sample:
+            assigned_classes = []
+            for env in envs.envs:
+                assigned_classes.append(env.sample_new_task())
+        else:
+            assigned_classes = make_balanced_class_assignment(
+                train_class_names,
+                args.num_envs,
+                task_assignment_rng,
+            )
+
+            for env, env_name in zip(envs.envs, assigned_classes):
+                env.sample_new_task(env_name=env_name)
 
         raw_obs, _ = envs.reset()
         obs_normalizer.update(raw_obs)
         obs = obs_normalizer.normalize(raw_obs)
 
         B, E, T = args.num_envs, args.trial_length, args.rollout_steps
+
+        rollout_uses_context_window = (args.context_seq_len > 0 and not args.no_rollout_context_seq_len)
 
         b_inputs = torch.zeros((B, E, T, input_dim), device=device)
         b_states = torch.zeros((B, E, T, obs_dim), device=device)
@@ -580,7 +754,7 @@ def train():
                 b_states[:, ep, step, :] = obs_t
 
                 context_window = None
-                if args.context_seq_len > 0:
+                if rollout_uses_context_window:
                     win_start = max(0, step + 1 - args.context_seq_len)
                     context_window = b_inputs[:, ep, win_start : step + 1, :]
 
@@ -653,6 +827,18 @@ def train():
             args.gae_lambda,
         )
 
+        #################################################################################
+        # Diagnostic: check whether global advantage normalization would shrink
+        # some task classes relative to others.
+        print_advantage_diagnostics_by_class(
+            b_adv=b_adv,
+            assigned_classes=assigned_classes,
+            update=update + 1,
+            ppo_epoch=None,
+            prefix="ADV_DIAG_PRE_PPO",
+        )
+        #################################################################################
+
         ppo_t0 = time.time()
         rollouts = (b_inputs, b_states, b_actions, b_logprobs, b_adv, b_returns)
         loss, p_loss, v_loss, ent = train_ppo(model, optimizer, rollouts, args, device)
@@ -662,6 +848,30 @@ def train():
         rollout_final_return = float(trial_ep_rewards[:, -1].mean())
         rollout_final_success = float(trial_ep_successes[:, -1].mean())
         rollout_anysuccess = float(trial_ep_successes.any(axis=1).mean())
+
+        rollout_task_rows = summarize_rollout_by_task_class(
+            assigned_classes,
+            trial_ep_rewards,
+            trial_ep_successes,
+        )
+        with open(rollout_task_csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            for row in rollout_task_rows:
+                writer.writerow(
+                    [
+                        update + 1,
+                        global_timesteps,
+                        row["env_name"],
+                        row["num_envs"],
+                        row["trial_return"],
+                        row["final_return"],
+                        row["final_success"],
+                        row["anysuccess"],
+                        row["mean_ep_success"],
+                        *row["episode_returns"],
+                        *row["episode_successes"],
+                    ]
+                )
 
         print(
             f"Update {update + 1}/{args.num_updates} | global_ep={global_episodes} | "
@@ -673,6 +883,19 @@ def train():
             f"final_success={100 * rollout_final_success:.1f}% "
             f"anysuccess={100 * rollout_anysuccess:.1f}%"
         )
+
+        if len(rollout_task_rows) <= 12:
+            class_summary = " | ".join(
+                f"{row['env_name']}: ret={row['trial_return']:.1f}, "
+                f"final_succ={100 * row['final_success']:.1f}%"
+                for row in rollout_task_rows
+            )
+            print(f"Rollout by task class | {class_summary}")
+        else:
+            print(
+                f"Rollout task-class metrics saved for {len(rollout_task_rows)} classes "
+                f"to {rollout_task_csv_path}"
+            )
 
         eval_summaries = {key: np.nan for key in eval_metric_keys}
 

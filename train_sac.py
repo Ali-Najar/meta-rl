@@ -69,7 +69,7 @@ def evaluate_meta_learning_sac(context_model, actor, meta_learning, obs_normaliz
     if context_model.aggregator_type == "concat" and eval_trial_length != context_model.num_episodes:
         raise ValueError(
             "Evaluation trial length different from training trial_length is only supported "
-            "with aggregator_type='mean' or 'ema'."
+            "with aggregator_type='mean', 'ema', or 'attn'."
         )
 
     envs = gym.vector.SyncVectorEnv(
@@ -236,7 +236,7 @@ def train():
         raise ValueError("train_sac.py is for ML1/ML10/ML45 meta-learning.")
     if args.aggregator_type == "concat":
         warnings.warn(
-            "SAC context sampling/detaching is designed for aggregator_type=mean or ema. "
+            "SAC context sampling/detaching is designed for aggregator_type=mean, ema, or attn. "
             "concat can run for rollout but sampled previous-episode SAC context is not supported.",
             UserWarning,
         )
@@ -297,6 +297,10 @@ def train():
         init_type=args.init_type,
         context_seq_len=args.context_seq_len,
         prev_context_window_mode=args.prev_context_window_mode,
+        use_context_gate=args.use_context_gate,
+        context_gate_hidden_sizes=args.context_gate_hidden_sizes,
+        context_gate_init_bias=args.context_gate_init_bias,
+        episode_attn_heads=args.episode_attn_heads,
         min_std=args.min_std,
         max_std=args.max_std,
         init_std=args.init_std,
@@ -311,10 +315,10 @@ def train():
     q2_target.load_state_dict(q2.state_dict())
     forecaster = KStepForecaster(obs_dim, args.hidden_size, action_dim, args.sac_hidden_sizes).to(device)
 
-    # Only the TTT input encoder and TTTModel are context parameters.
+    # Only modules that affect the context representation z are optimized here.
     # TTTEpisodePolicy also has PPO-style policy/value heads, but train_sac.py
     # does not use them. Keeping them out avoids unused optimizer state.
-    context_params = list(context_model.input_encoder.parameters()) + list(context_model.model.parameters())
+    context_params = context_model.context_parameters()
     optimizers = {
         "actor": optim.Adam(actor.parameters(), lr=args.sac_actor_lr),
         "critic": optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=args.sac_critic_lr),
