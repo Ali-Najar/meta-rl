@@ -35,14 +35,14 @@ def get_args():
     parser.add_argument("--env_name", type=str, default="push-v3")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--num_envs", type=int, default=50, help="Number of parallel environments during training.")
-    parser.add_argument("--trial_length", type=int, default=1, help="Episodes per trial and episode-memory slots.")
+    parser.add_argument("--trial_length", type=int, default=5, help="Episodes per trial and episode-memory slots.")
     parser.add_argument("--rollout_steps", type=int, default=500, help="Steps per episode.")
     parser.add_argument("--random_task_sample", action="store_true", help="Sample training task classes independently instead of balancing per update.")
 
     parser.add_argument("--agent_mode", type=str, default="agent_rl2", choices=["agent_v1", "agent_v2", "agent_rl2"])
-    parser.add_argument("--hidden_size", type=int, default=256)
-    parser.add_argument("--num_hidden_layers", type=int, default=4)
-    parser.add_argument("--num_attention_heads", type=int, default=4)
+    parser.add_argument("--hidden_size", type=int, default=128)
+    parser.add_argument("--num_hidden_layers", type=int, default=2)
+    parser.add_argument("--num_attention_heads", type=int, default=1)
     parser.add_argument("--mini_batch_size", type=int, default=4)
     parser.add_argument("--ttt_layer_type", type=str, default="mlp", choices=["linear", "mlp"])
 
@@ -61,19 +61,19 @@ def get_args():
     parser.add_argument(
         "--policy_hidden_sizes",
         type=parse_hidden_sizes,
-        default=(),
+        default=(64,64),
         help="Comma-separated actor hidden sizes. Use 0/none/linear for a linear policy mean head.",
     )
     parser.add_argument(
         "--value_hidden_sizes",
         type=parse_hidden_sizes,
-        default=(),
+        default=(64,64),
         help="Comma-separated critic hidden sizes. Use 0/none/linear for a linear value head.",
     )
     parser.add_argument(
         "--aggregator_type",
         type=str,
-        default="ema",
+        default="attn",
         choices=["ema", "attn"],
         help=(
             "ema = recency-weighted EMA over previous episode finals plus current hidden; "
@@ -83,7 +83,7 @@ def get_args():
     parser.add_argument(
         "--ema_beta",
         type=float,
-        default=0.7,
+        default=0.5,
         help="EMA decay for --aggregator_type ema. Higher values keep longer memory.",
     )
     parser.add_argument(
@@ -100,9 +100,9 @@ def get_args():
     )
     parser.set_defaults(use_state_proj=True)
 
-    parser.add_argument("--num_updates", type=int, default=1000)
-    parser.add_argument("--ppo_epochs", type=int, default=30)
-    parser.add_argument("--ppo_minibatch_envs", type=int, default=30, help="Number of trials/envs per PPO minibatch.")
+    parser.add_argument("--num_updates", type=int, default=400)
+    parser.add_argument("--ppo_epochs", type=int, default=10)
+    parser.add_argument("--ppo_minibatch_envs", type=int, default=10, help="Number of trials/envs per PPO minibatch.")
     parser.add_argument(
         "--ppo_minibatch_steps",
         type=int,
@@ -129,18 +129,18 @@ def get_args():
     parser.add_argument("--init_std", type=float, default=0.5)
 
     parser.add_argument("--eval_interval", type=int, default=5, help="Evaluate every N updates.")
-    parser.add_argument("--eval_num_tasks", type=int, default=25, help="Sample this many eval variations.")
+    parser.add_argument("--eval_num_tasks", type=int, default=100, help="Sample this many eval variations.")
     parser.add_argument("--eval_num_trials", type=int, default=1, help="Number of evaluation trials per vectorized eval worker.")
     parser.add_argument(
         "--eval_trial_length",
         type=int,
-        default=None,
+        default=25,
         help="Number of episodes to run per evaluation trial. If omitted, uses --trial_length.",
     )
     parser.add_argument(
         "--eval_report_lengths",
         type=parse_int_list,
-        default=None,
+        default=(5,25),
         help="Comma-separated prefix lengths to summarize from one eval rollout, e.g. 5,25.",
     )
     parser.add_argument("--comment", type=str, default="")
