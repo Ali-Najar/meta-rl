@@ -6,16 +6,19 @@ import sys
 from datetime import datetime
 import random
 import warnings
+import argparse
 
 import gymnasium as gym
 import metaworld
 import numpy as np
 import torch
 import torch.optim as optim
+from torch import nn
+import torch.nn.functional as F
 
 from ttt import TTTConfig
 from agent import TTTEpisodePolicy
-from arguments import get_args
+from arguments import get_args, parse_hidden_sizes
 from utils import (
     MetaWorldTaskSamplerEnv,
     RunningMeanStd,
@@ -136,6 +139,203 @@ def summarize_rollout_by_task_class(assigned_classes, trial_ep_rewards, trial_ep
             }
         )
     return rows
+
+
+
+def parse_probe_args_and_strip_sys_argv():
+    """Parse task-ID probe flags while leaving normal PPO flags for get_args().
+
+    This keeps arguments.py unchanged. The script first consumes only probe-specific
+    flags, then rewrites sys.argv so the original PPO parser sees the same options
+    it already understands.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--probe_hidden_sizes", type=parse_hidden_sizes, default=(128,128))
+    parser.add_argument("--probe_lr", type=float, default=1e-3)
+    parser.add_argument("--probe_epochs", type=int, default=20)
+    parser.add_argument("--probe_batch_size", type=int, default=64)
+    parser.add_argument("--probe_val_fraction", type=float, default=0.25)
+    parser.add_argument(
+        "--probe_buffer_updates",
+        type=int,
+        default=1,
+        help=(
+            "Number of recent PPO rollout batches of detached episode embeddings "
+            "to keep for the task-ID probe. 1 means train/evaluate only on the "
+            "current rollout representation."
+        ),
+    )
+    parser.add_argument("--probe_interval", type=int, default=1, help="Train/evaluate probe every N PPO updates.")
+    parser.add_argument("--probe_weight_decay", type=float, default=0.0)
+    parser.add_argument(
+        "--probe_reset_each_update",
+        action="store_true",
+        help=(
+            "Reinitialize the probe classifier at each probe interval before fitting on the "
+            "current/FIFO detached embeddings. This is stricter but slower/noisier."
+        ),
+    )
+    parser.add_argument(
+        "--probe_grad_clip",
+        type=float,
+        default=10.0,
+        help="Max grad norm for the probe classifier. Use <=0 to disable clipping.",
+    )
+
+    probe_args, remaining = parser.parse_known_args()
+    sys.argv = [sys.argv[0], *remaining]
+    if probe_args.probe_buffer_updates <= 0:
+        raise ValueError("--probe_buffer_updates must be positive.")
+    if probe_args.probe_interval <= 0:
+        raise ValueError("--probe_interval must be positive.")
+    if not (0.0 < probe_args.probe_val_fraction < 1.0):
+        raise ValueError("--probe_val_fraction must be in (0, 1).")
+    return probe_args
+
+
+class TaskIdProbe(nn.Module):
+    """Small classifier trained on detached TTT episode embeddings."""
+
+    def __init__(self, input_dim, num_classes, hidden_sizes=(128,)):
+        super().__init__()
+        layers = []
+        prev = int(input_dim)
+        for hidden in hidden_sizes:
+            hidden = int(hidden)
+            layers.append(nn.Linear(prev, hidden))
+            layers.append(nn.ReLU())
+            prev = hidden
+        layers.append(nn.Linear(prev, int(num_classes)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ProbeBuffer:
+    """FIFO buffer of detached episode embeddings from recent PPO rollouts."""
+
+    def __init__(self, max_updates=1):
+        self.max_updates = int(max_updates)
+        self._chunks = []
+
+    def add(self, episode_embeddings, task_ids):
+        """Add one PPO rollout batch.
+
+        episode_embeddings: (B,E,H) detached tensor.
+        task_ids: (B,) long tensor giving class id per vector env.
+        """
+        x = episode_embeddings.detach().cpu().float()
+        y_env = task_ids.detach().cpu().long()
+        if x.ndim != 3:
+            raise ValueError(f"episode_embeddings must be (B,E,H), got {tuple(x.shape)}")
+        B, E, H = x.shape
+        if y_env.shape != (B,):
+            raise ValueError(f"task_ids must be (B,), got {tuple(y_env.shape)} for B={B}")
+        y = y_env[:, None].expand(B, E).reshape(B * E)
+        ep = torch.arange(E, dtype=torch.long)[None, :].expand(B, E).reshape(B * E)
+        self._chunks.append((x.reshape(B * E, H), y, ep))
+        if len(self._chunks) > self.max_updates:
+            self._chunks = self._chunks[-self.max_updates :]
+
+    def tensors(self):
+        if not self._chunks:
+            raise RuntimeError("ProbeBuffer is empty.")
+        x = torch.cat([c[0] for c in self._chunks], dim=0)
+        y = torch.cat([c[1] for c in self._chunks], dim=0)
+        ep = torch.cat([c[2] for c in self._chunks], dim=0)
+        return x, y, ep
+
+
+def stratified_train_val_split(labels, val_fraction, seed):
+    """Return train/val indices with each class represented in validation when possible."""
+    labels = labels.detach().cpu().long()
+    g = torch.Generator().manual_seed(int(seed))
+    train_parts = []
+    val_parts = []
+    for cls in torch.unique(labels).tolist():
+        idx = torch.nonzero(labels == int(cls), as_tuple=False).flatten()
+        idx = idx[torch.randperm(idx.numel(), generator=g)]
+        if idx.numel() <= 1:
+            train_parts.append(idx)
+            continue
+        n_val = max(1, int(round(float(idx.numel()) * float(val_fraction))))
+        n_val = min(n_val, idx.numel() - 1)
+        val_parts.append(idx[:n_val])
+        train_parts.append(idx[n_val:])
+    train_idx = torch.cat(train_parts, dim=0)
+    val_idx = torch.cat(val_parts, dim=0) if val_parts else train_idx[:0]
+    train_idx = train_idx[torch.randperm(train_idx.numel(), generator=g)]
+    if val_idx.numel() > 0:
+        val_idx = val_idx[torch.randperm(val_idx.numel(), generator=g)]
+    return train_idx, val_idx
+
+
+@torch.no_grad()
+def evaluate_probe(probe, x, y, ep_idx, indices, num_episodes, device):
+    if indices.numel() == 0:
+        return {"loss": float("nan"), "acc": float("nan"), "episode_acc": [float("nan")] * num_episodes}
+    probe.eval()
+    x_sel = x[indices].to(device=device, dtype=torch.float32)
+    y_sel = y[indices].to(device=device, dtype=torch.long)
+    logits = probe(x_sel)
+    loss = F.cross_entropy(logits, y_sel).item()
+    pred = logits.argmax(dim=-1).cpu()
+    y_cpu = y_sel.cpu()
+    acc = float((pred == y_cpu).float().mean().item())
+
+    episode_acc = []
+    ep_cpu = ep_idx[indices].cpu()
+    for ep in range(num_episodes):
+        mask = ep_cpu == ep
+        if not mask.any():
+            episode_acc.append(float("nan"))
+        else:
+            episode_acc.append(float((pred[mask] == y_cpu[mask]).float().mean().item()))
+    return {"loss": loss, "acc": acc, "episode_acc": episode_acc}
+
+
+def train_task_id_probe(probe, optimizer, buffer, probe_args, num_episodes, update, device):
+    """Train/evaluate the detached task-ID probe on the current FIFO buffer."""
+    x, y, ep_idx = buffer.tensors()
+    train_idx, val_idx = stratified_train_val_split(
+        y,
+        val_fraction=probe_args.probe_val_fraction,
+        seed=100_000 + int(update),
+    )
+
+    probe.train()
+    batch_size = min(int(probe_args.probe_batch_size), max(1, train_idx.numel()))
+    g = torch.Generator().manual_seed(200_000 + int(update))
+    last_loss = float("nan")
+
+    for _ in range(int(probe_args.probe_epochs)):
+        perm = train_idx[torch.randperm(train_idx.numel(), generator=g)]
+        for start in range(0, perm.numel(), batch_size):
+            idx = perm[start : start + batch_size]
+            xb = x[idx].to(device=device, dtype=torch.float32)
+            yb = y[idx].to(device=device, dtype=torch.long)
+            logits = probe(xb)
+            loss = F.cross_entropy(logits, yb)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if probe_args.probe_grad_clip and probe_args.probe_grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(probe.parameters(), probe_args.probe_grad_clip)
+            optimizer.step()
+            last_loss = float(loss.item())
+
+    train_metrics = evaluate_probe(probe, x, y, ep_idx, train_idx, num_episodes, device)
+    val_metrics = evaluate_probe(probe, x, y, ep_idx, val_idx, num_episodes, device)
+    return {
+        "loss": last_loss,
+        "train_loss": train_metrics["loss"],
+        "train_acc": train_metrics["acc"],
+        "val_loss": val_metrics["loss"],
+        "val_acc": val_metrics["acc"],
+        "val_episode_acc": val_metrics["episode_acc"],
+        "n_train": int(train_idx.numel()),
+        "n_val": int(val_idx.numel()),
+    }
 
 
 def build_metaworld(args):
@@ -295,96 +495,8 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
     return summaries, detailed_rows
 
 
-def compute_learning_signal_by_class(
-    assigned_classes,
-    trial_ep_rewards,
-    trial_ep_successes,
-    b_adv,
-    b_returns,
-    b_values,
-    b_logprobs,
-    b_valid=None,
-):
-    """Summarize per-task PPO learning signal for one collected rollout.
-
-    assigned_classes: list[str], length B
-    trial_ep_rewards: np.ndarray (B, E)
-    trial_ep_successes: np.ndarray (B, E)
-    b_adv, b_returns, b_values, b_logprobs: torch tensors (B, E, T)
-    b_valid: optional torch tensor (B, E, T), 1 for real rollout positions
-    """
-    rows = []
-
-    with torch.no_grad():
-        adv = b_adv.detach().float().cpu()
-        ret = b_returns.detach().float().cpu()
-        val = b_values.detach().float().cpu()
-        logp = b_logprobs.detach().float().cpu()
-
-        if b_valid is None:
-            valid = torch.ones_like(adv, dtype=torch.bool)
-        else:
-            valid = b_valid.detach().cpu().bool()
-
-        unique_classes = sorted(set(assigned_classes))
-
-        for cls in unique_classes:
-            env_idx = [i for i, name in enumerate(assigned_classes) if name == cls]
-            if len(env_idx) == 0:
-                continue
-
-            cls_mask = valid[env_idx]
-            cls_adv = adv[env_idx][cls_mask]
-            cls_ret = ret[env_idx][cls_mask]
-            cls_val = val[env_idx][cls_mask]
-            cls_logp = logp[env_idx][cls_mask]
-
-            if cls_adv.numel() == 0:
-                continue
-
-            value_err = cls_ret - cls_val
-            value_mse = (value_err ** 2).mean()
-
-            ret_var = cls_ret.var(unbiased=False)
-            err_var = value_err.var(unbiased=False)
-            if ret_var.item() > 1e-8:
-                explained_var = 1.0 - (err_var / ret_var)
-                explained_var = float(explained_var.item())
-            else:
-                explained_var = float("nan")
-
-            rows.append(
-                {
-                    "env_name": cls,
-                    "num_envs": len(env_idx),
-                    "num_samples": int(cls_adv.numel()),
-                    "trial_return": float(trial_ep_rewards[env_idx].sum(axis=1).mean()),
-                    "final_return": float(trial_ep_rewards[env_idx, -1].mean()),
-                    "final_success": float(trial_ep_successes[env_idx, -1].mean()),
-                    "anysuccess": float(trial_ep_successes[env_idx].any(axis=1).mean()),
-                    "mean_ep_success": float(trial_ep_successes[env_idx].mean()),
-                    "adv_mean": float(cls_adv.mean().item()),
-                    "adv_std": float(cls_adv.std(unbiased=False).item()),
-                    "adv_abs_mean": float(cls_adv.abs().mean().item()),
-                    "adv_min": float(cls_adv.min().item()),
-                    "adv_max": float(cls_adv.max().item()),
-                    "positive_adv_frac": float((cls_adv > 0).float().mean().item()),
-                    "negative_adv_frac": float((cls_adv < 0).float().mean().item()),
-                    "return_mean": float(cls_ret.mean().item()),
-                    "return_std": float(cls_ret.std(unbiased=False).item()),
-                    "value_mean": float(cls_val.mean().item()),
-                    "value_std": float(cls_val.std(unbiased=False).item()),
-                    "value_mse": float(value_mse.item()),
-                    "value_abs_error": float(value_err.abs().mean().item()),
-                    "explained_variance": explained_var,
-                    "logprob_mean": float(cls_logp.mean().item()),
-                    "logprob_std": float(cls_logp.std(unbiased=False).item()),
-                }
-            )
-
-    return rows
-
 def train():
+    probe_args = parse_probe_args_and_strip_sys_argv()
     args = get_args()
     set_seed(args.seed)
 
@@ -471,8 +583,23 @@ def train():
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    probe = TaskIdProbe(
+        input_dim=args.hidden_size,
+        num_classes=len(train_class_names),
+        hidden_sizes=probe_args.probe_hidden_sizes,
+    ).to(device)
+    probe_optimizer = optim.Adam(
+        probe.parameters(),
+        lr=probe_args.probe_lr,
+        weight_decay=probe_args.probe_weight_decay,
+    )
+    probe_buffer = ProbeBuffer(max_updates=probe_args.probe_buffer_updates)
+
     out_dir = make_run_dir(args)
     print(f"Run directory: {out_dir}")
+    with open(os.path.join(out_dir, "task_probe_config.json"), "w") as f:
+        json.dump(vars(probe_args), f, indent=2, sort_keys=True)
 
     csv_path = os.path.join(out_dir, "metrics.csv")
     eval_metric_keys = []
@@ -503,39 +630,6 @@ def train():
     ]
     with open(csv_path, "w", newline="") as f:
         csv.writer(f).writerow(metrics_header)
-
-    rollout_signal_csv_path = os.path.join(out_dir, "rollout_task_learning_signal.csv")
-    rollout_signal_header = [
-        "update",
-        "timestep",
-        "env_name",
-        "num_envs",
-        "num_samples",
-        "trial_return",
-        "final_return",
-        "final_success",
-        "anysuccess",
-        "mean_ep_success",
-        "adv_mean",
-        "adv_std",
-        "adv_abs_mean",
-        "adv_min",
-        "adv_max",
-        "positive_adv_frac",
-        "negative_adv_frac",
-        "return_mean",
-        "return_std",
-        "value_mean",
-        "value_std",
-        "value_mse",
-        "value_abs_error",
-        "explained_variance",
-        "logprob_mean",
-        "logprob_std",
-    ]
-
-    with open(rollout_signal_csv_path, "w", newline="") as f:
-        csv.writer(f).writerow(rollout_signal_header)
 
     eval_episode_csv_path = os.path.join(out_dir, "eval_episode_success.csv")
     with open(eval_episode_csv_path, "w", newline="") as f:
@@ -571,6 +665,22 @@ def train():
     rollout_task_header.extend([f"episode_{i + 1}_success" for i in range(args.trial_length)])
     with open(rollout_task_csv_path, "w", newline="") as f:
         csv.writer(f).writerow(rollout_task_header)
+
+    task_probe_csv_path = os.path.join(out_dir, "task_probe_metrics.csv")
+    task_probe_header = [
+        "update",
+        "timestep",
+        "probe_loss",
+        "probe_train_loss",
+        "probe_train_acc",
+        "probe_val_loss",
+        "probe_val_acc",
+        "probe_n_train",
+        "probe_n_val",
+    ]
+    task_probe_header.extend([f"probe_val_acc_episode_{i + 1}" for i in range(args.trial_length)])
+    with open(task_probe_csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(task_probe_header)
 
     raw_obs, _ = envs.reset()
     obs_normalizer.update(raw_obs)
@@ -681,6 +791,10 @@ def train():
                 prev_reward[:] = 0.0
                 prev_done[:] = 0.0
 
+        # Detached PPO-learned TTT episode representations for the task-ID probe.
+        # Shape: (B, E, H), one final TTT hidden state per collected episode.
+        probe_episode_embeddings = episode_memory[:, :E, :].detach().clone()
+
         data_time = time.time() - t0
 
         with torch.no_grad():
@@ -693,62 +807,6 @@ def train():
             args.gamma,
             args.gae_lambda,
         )
-
-        signal_rows = compute_learning_signal_by_class(
-            assigned_classes=assigned_classes,
-            trial_ep_rewards=trial_ep_rewards,
-            trial_ep_successes=trial_ep_successes,
-            b_adv=b_adv,
-            b_returns=b_returns,
-            b_values=b_values,
-            b_logprobs=b_logprobs,
-            b_valid=b_valid if "b_valid" in locals() else None,
-        )
-
-        with open(rollout_signal_csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            for row in signal_rows:
-                writer.writerow(
-                    [
-                        update + 1,
-                        global_timesteps,
-                        row["env_name"],
-                        row["num_envs"],
-                        row["num_samples"],
-                        row["trial_return"],
-                        row["final_return"],
-                        row["final_success"],
-                        row["anysuccess"],
-                        row["mean_ep_success"],
-                        row["adv_mean"],
-                        row["adv_std"],
-                        row["adv_abs_mean"],
-                        row["adv_min"],
-                        row["adv_max"],
-                        row["positive_adv_frac"],
-                        row["negative_adv_frac"],
-                        row["return_mean"],
-                        row["return_std"],
-                        row["value_mean"],
-                        row["value_std"],
-                        row["value_mse"],
-                        row["value_abs_error"],
-                        row["explained_variance"],
-                        row["logprob_mean"],
-                        row["logprob_std"],
-                    ]
-                )
-        
-        print("Learning signal by task:")
-        for row in signal_rows:
-            print(
-                f"  {row['env_name']:<28s} "
-                f"succ={100 * row['final_success']:5.1f}% "
-                f"adv_std={row['adv_std']:.3f} "
-                f"adv_abs={row['adv_abs_mean']:.3f} "
-                f"v_mse={row['value_mse']:.3f} "
-                f"ev={row['explained_variance']:.3f}"
-            )
 
         ppo_t0 = time.time()
         rollouts = (
@@ -763,6 +821,49 @@ def train():
         )
         loss, p_loss, v_loss, ent = train_ppo(model, optimizer, rollouts, args, device)
         ppo_time = time.time() - ppo_t0
+
+        probe_time = 0.0
+        probe_metrics = None
+        if (update + 1) % probe_args.probe_interval == 0:
+            probe_t0 = time.time()
+            if probe_args.probe_reset_each_update:
+                probe = TaskIdProbe(
+                    input_dim=args.hidden_size,
+                    num_classes=len(train_class_names),
+                    hidden_sizes=probe_args.probe_hidden_sizes,
+                ).to(device)
+                probe_optimizer = optim.Adam(
+                    probe.parameters(),
+                    lr=probe_args.probe_lr,
+                    weight_decay=probe_args.probe_weight_decay,
+                )
+                probe_buffer = ProbeBuffer(max_updates=probe_args.probe_buffer_updates)
+            probe_buffer.add(probe_episode_embeddings, b_task_ids)
+            probe_metrics = train_task_id_probe(
+                probe,
+                probe_optimizer,
+                probe_buffer,
+                probe_args,
+                num_episodes=E,
+                update=update + 1,
+                device=device,
+            )
+            probe_time = time.time() - probe_t0
+            with open(task_probe_csv_path, "a", newline="") as f:
+                csv.writer(f).writerow(
+                    [
+                        update + 1,
+                        global_timesteps,
+                        probe_metrics["loss"],
+                        probe_metrics["train_loss"],
+                        probe_metrics["train_acc"],
+                        probe_metrics["val_loss"],
+                        probe_metrics["val_acc"],
+                        probe_metrics["n_train"],
+                        probe_metrics["n_val"],
+                        *probe_metrics["val_episode_acc"],
+                    ]
+                )
 
         rollout_trial_return = float(trial_ep_rewards.sum(axis=1).mean())
         rollout_final_return = float(trial_ep_rewards[:, -1].mean())
@@ -795,13 +896,20 @@ def train():
 
         print(
             f"Update {update + 1}/{args.num_updates} | global_ep={global_episodes} | "
-            f"timesteps={global_timesteps} | Data={data_time:.2f}s PPO={ppo_time:.2f}s | "
+            f"timesteps={global_timesteps} | Data={data_time:.2f}s PPO={ppo_time:.2f}s Probe={probe_time:.2f}s | "
             f"loss={loss:.4f} p={p_loss:.4f} v={v_loss:.4f} ent={ent:.4f} | "
             f"rollout_trial_return={rollout_trial_return:.2f} "
             f"final_return={rollout_final_return:.2f} "
             f"final_success={100 * rollout_final_success:.1f}% "
             f"anysuccess={100 * rollout_anysuccess:.1f}%"
         )
+
+        if probe_metrics is not None:
+            print(
+                f"Task-ID probe | train_acc={100 * probe_metrics['train_acc']:.1f}% "
+                f"val_acc={100 * probe_metrics['val_acc']:.1f}% "
+                f"n_train={probe_metrics['n_train']} n_val={probe_metrics['n_val']}"
+            )
 
         if len(rollout_task_rows) <= 12:
             class_summary = " | ".join(
@@ -861,6 +969,7 @@ def train():
             csv.writer(f).writerow(metrics_row)
 
     torch.save({"model": model.state_dict()}, os.path.join(out_dir, "ttt_ecet_policy.pth"))
+    torch.save({"probe": probe.state_dict()}, os.path.join(out_dir, "task_id_probe.pth"))
     envs.close()
 
 

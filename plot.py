@@ -34,8 +34,12 @@ def load_metrics(root: Path):
     for csv_path in csv_files:
         run_name = csv_path.parent.name
         ##################################
-        if "ML10" not in run_name:
-            continue
+        if "small" not in run_name:
+            if "heads" not in run_name:
+                if "fixed" not in run_name:
+                    continue
+        # if "ML10" not in run_name:
+        #     continue
         ##################################
         df = pd.read_csv(csv_path)
         x_col = "timestep" if "timestep" in df.columns else "update"
