@@ -171,6 +171,44 @@ class RewardNormalizer:
 
 
 
+class ClassRewardNormalizer:
+    """One RewardNormalizer per task class for PPO reward targets.
+
+    This is intended for multi-task settings such as ML10/ML45 where reward
+    distributions can differ across task classes. The task labels are used only
+    to normalize the scalar training rewards before GAE; they are not fed to the
+    policy or TTT input.
+    """
+
+    def __init__(self, gamma=0.99):
+        self.gamma = gamma
+        self.normalizers = {}
+
+    def normalize(self, rewards, dones, task_classes):
+        rewards = np.asarray(rewards, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32)
+        task_classes = np.asarray(task_classes, dtype=object)
+
+        if rewards.ndim != 1:
+            raise ValueError(f"ClassRewardNormalizer expects rewards shape (B,), got {rewards.shape}")
+        if dones.shape != rewards.shape:
+            raise ValueError(f"dones shape {dones.shape} must match rewards shape {rewards.shape}")
+        if task_classes.shape[0] != rewards.shape[0]:
+            raise ValueError(
+                f"task_classes length {task_classes.shape[0]} must match rewards length {rewards.shape[0]}"
+            )
+
+        normalized = np.zeros_like(rewards, dtype=np.float32)
+        for cls in sorted(set(task_classes.tolist())):
+            mask = task_classes == cls
+            key = str(cls)
+            if key not in self.normalizers:
+                self.normalizers[key] = RewardNormalizer(gamma=self.gamma)
+            normalized[mask] = self.normalizers[key].normalize(rewards[mask], dones[mask])
+        return normalized
+
+
+
 def get_agent_input(obs, prev_action, prev_reward, prev_done, agent_mode):
     if obs.ndim == 1:
         obs = obs[np.newaxis, :]
@@ -227,37 +265,17 @@ def _select_time(x, positions):
     return x[:, positions]
 
 
-def _ppo_step_from_sequences(
-    model,
-    optimizer,
-    mean,
-    log_std,
-    values,
-    actions,
-    old_log_probs,
-    adv,
-    returns,
-    positions,
+def _sequence_loss_terms(
+    mean_sel,
+    log_std_sel,
+    values_sel,
+    actions_sel,
+    old_log_probs_sel,
+    adv_sel,
+    returns_sel,
     args,
 ):
-    """Compute one PPO step on selected positions from already-forwarded sequences."""
-    if positions is None:
-        mean_sel = mean
-        log_std_sel = log_std
-        values_sel = values
-        actions_sel = actions
-        old_log_probs_sel = old_log_probs
-        adv_sel = adv
-        returns_sel = returns
-    else:
-        mean_sel = _select_time(mean, positions)
-        log_std_sel = _select_time(log_std, positions)
-        values_sel = _select_time(values, positions)
-        actions_sel = _select_time(actions, positions)
-        old_log_probs_sel = _select_time(old_log_probs, positions)
-        adv_sel = _select_time(adv, positions)
-        returns_sel = _select_time(returns, positions)
-
+    """Return PPO loss terms for one already-selected sequence batch."""
     action_dim = mean_sel.shape[-1]
     dist = torch.distributions.Normal(
         mean_sel.reshape(-1, action_dim),
@@ -277,6 +295,109 @@ def _ppo_step_from_sequences(
     policy_loss = -torch.min(surr1, surr2).mean()
     value_loss = nn.functional.mse_loss(values_flat, returns_flat)
     loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
+    return loss, policy_loss, value_loss, entropy
+
+
+def _grad_norm_from_loss(loss, params):
+    """Compute unclipped gradient norm for a diagnostic loss without mutating .grad."""
+    grads = torch.autograd.grad(
+        loss,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    total_sq = loss.new_tensor(0.0)
+    for grad in grads:
+        if grad is None:
+            continue
+        total_sq = total_sq + grad.detach().pow(2).sum()
+    return torch.sqrt(total_sq).item()
+
+
+def _ppo_step_from_sequences(
+    model,
+    optimizer,
+    mean,
+    log_std,
+    values,
+    actions,
+    old_log_probs,
+    adv,
+    returns,
+    positions,
+    args,
+    task_ids=None,
+    class_diagnostics=None,
+):
+    """Compute one PPO step on selected positions from already-forwarded sequences.
+
+    If task_ids and class_diagnostics are provided, also record per-class PPO
+    losses and per-class unclipped gradient norms for this optimizer step.
+    These diagnostics do not change the actual PPO update.
+    """
+    if positions is None:
+        mean_sel = mean
+        log_std_sel = log_std
+        values_sel = values
+        actions_sel = actions
+        old_log_probs_sel = old_log_probs
+        adv_sel = adv
+        returns_sel = returns
+    else:
+        mean_sel = _select_time(mean, positions)
+        log_std_sel = _select_time(log_std, positions)
+        values_sel = _select_time(values, positions)
+        actions_sel = _select_time(actions, positions)
+        old_log_probs_sel = _select_time(old_log_probs, positions)
+        adv_sel = _select_time(adv, positions)
+        returns_sel = _select_time(returns, positions)
+
+    loss, policy_loss, value_loss, entropy = _sequence_loss_terms(
+        mean_sel,
+        log_std_sel,
+        values_sel,
+        actions_sel,
+        old_log_probs_sel,
+        adv_sel,
+        returns_sel,
+        args,
+    )
+
+    if task_ids is not None and class_diagnostics is not None:
+        params = [p for p in model.parameters() if p.requires_grad]
+        task_ids = task_ids.to(device=mean_sel.device, dtype=torch.long)
+        if task_ids.ndim != 1 or task_ids.shape[0] != mean_sel.shape[0]:
+            raise ValueError(
+                f"task_ids must have shape (batch_envs,), got {tuple(task_ids.shape)} "
+                f"for sequence batch shape {tuple(mean_sel.shape)}"
+            )
+        for task_id in torch.unique(task_ids):
+            env_mask = task_ids == task_id
+            if not env_mask.any():
+                continue
+            cls_loss, cls_policy_loss, cls_value_loss, cls_entropy = _sequence_loss_terms(
+                mean_sel[env_mask],
+                log_std_sel[env_mask],
+                values_sel[env_mask],
+                actions_sel[env_mask],
+                old_log_probs_sel[env_mask],
+                adv_sel[env_mask],
+                returns_sel[env_mask],
+                args,
+            )
+            cls_grad_norm = _grad_norm_from_loss(cls_loss, params)
+            class_diagnostics.append(
+                {
+                    "task_id": int(task_id.item()),
+                    "num_envs": int(env_mask.sum().item()),
+                    "num_samples": int(env_mask.sum().item() * adv_sel.shape[1]),
+                    "loss": float(cls_loss.detach().item()),
+                    "policy_loss": float(cls_policy_loss.detach().item()),
+                    "value_loss": float(cls_value_loss.detach().item()),
+                    "entropy": float(cls_entropy.detach().item()),
+                    "grad_norm": float(cls_grad_norm),
+                }
+            )
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -385,6 +506,40 @@ def _normalize_advantages_tensor(b_adv, b_valid, b_task_ids=None, by_class=False
     return b_adv_norm
 
 
+
+def _summarize_class_diagnostics(records):
+    """Aggregate per-step per-class PPO diagnostics over one PPO update."""
+    if not records:
+        return []
+    by_task = {}
+    for row in records:
+        task_id = int(row["task_id"])
+        by_task.setdefault(task_id, []).append(row)
+
+    summaries = []
+    for task_id, rows in sorted(by_task.items()):
+        total_samples = sum(max(1, int(r.get("num_samples", 1))) for r in rows)
+
+        def weighted_mean(key):
+            return sum(float(r[key]) * max(1, int(r.get("num_samples", 1))) for r in rows) / max(1, total_samples)
+
+        grad_norms = [float(r["grad_norm"]) for r in rows]
+        summaries.append(
+            {
+                "task_id": task_id,
+                "num_records": len(rows),
+                "num_samples": int(total_samples),
+                "loss": weighted_mean("loss"),
+                "policy_loss": weighted_mean("policy_loss"),
+                "value_loss": weighted_mean("value_loss"),
+                "entropy": weighted_mean("entropy"),
+                "grad_norm_mean": sum(grad_norms) / max(1, len(grad_norms)),
+                "grad_norm_max": max(grad_norms),
+            }
+        )
+    return summaries
+
+
 def _train_ppo_sequential(model, optimizer, rollouts, args, device):
     """Chronological chunk PPO update.
 
@@ -414,12 +569,15 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
     total_loss = 0.0
     total_minibatches = 0
     last_norm = 0.0
+    log_class_diagnostics = bool(getattr(args, "log_ppo_class_diagnostics", False))
+    class_diagnostics = [] if log_class_diagnostics else None
 
     for _ in range(args.ppo_epochs):
         env_perm = torch.randperm(num_envs, device=device)
         for start_idx in range(0, num_envs, mb_envs):
             env_idx = env_perm[start_idx : start_idx + mb_envs]
             b_adv_mb = b_adv[env_idx]
+            mb_task_ids = b_task_ids[env_idx] if b_task_ids is not None else None
 
             for ep_idx in range(num_eps):
                 for step_start in range(0, ep_len, mb_steps):
@@ -467,6 +625,8 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
                         returns_seq,
                         pos,
                         args,
+                        task_ids=mb_task_ids if log_class_diagnostics else None,
+                        class_diagnostics=class_diagnostics,
                     )
 
                     total_policy_loss += p_loss
@@ -476,11 +636,18 @@ def _train_ppo_sequential(model, optimizer, rollouts, args, device):
                     total_minibatches += 1
 
     denom = max(1, total_minibatches)
+    class_diag_summary = _summarize_class_diagnostics(class_diagnostics or [])
     print(
         f"PPO Update -> mode=sequential scope=chunk | "
         f"Grad Norm: {float(last_norm):.2f} | optimizer_steps={total_minibatches}"
     )
-    return total_loss / denom, total_policy_loss / denom, total_value_loss / denom, total_entropy / denom
+    return (
+        total_loss / denom,
+        total_policy_loss / denom,
+        total_value_loss / denom,
+        total_entropy / denom,
+        class_diag_summary,
+    )
 
 
 def train_ppo(model, optimizer, rollouts, args, device):

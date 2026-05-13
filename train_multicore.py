@@ -6,6 +6,8 @@ import sys
 from datetime import datetime
 import random
 import warnings
+import multiprocessing as mp
+import traceback
 
 import gymnasium as gym
 import metaworld
@@ -95,6 +97,270 @@ def make_sampler_env(classes, tasks, seed, mask_goal=True):
     return thunk
 
 
+
+def _combine_vector_infos(info_list):
+    """Convert a list of per-env info dicts into a vector-style info dict."""
+    if not info_list:
+        return {}
+    keys = set()
+    for info in info_list:
+        keys.update(info.keys())
+    out = {}
+    for key in keys:
+        values = [info.get(key) for info in info_list]
+        try:
+            out[key] = np.asarray(values)
+        except Exception:
+            out[key] = values
+    return out
+
+
+def _env_worker(remote, parent_remote, classes, tasks, base_seed, mask_goal, env_indices):
+    """Worker process for a shard of MetaWorldTaskSamplerEnv instances."""
+    parent_remote.close()
+    envs = []
+    try:
+        # Avoid accidental CPU oversubscription in each environment worker.
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+        try:
+            torch.set_num_threads(1)
+        except Exception:
+            pass
+
+        envs = [
+            MetaWorldTaskSamplerEnv(classes, tasks, seed=base_seed + int(env_idx), mask_goal=mask_goal)
+            for env_idx in env_indices
+        ]
+
+        while True:
+            cmd, data = remote.recv()
+            if cmd == "get_spaces":
+                env0 = envs[0]
+                remote.send((env0.action_space, env0.observation_space))
+
+            elif cmd == "sample":
+                # data is a list of env_name/None values, one per local env.
+                if len(data) != len(envs):
+                    raise ValueError(f"Worker expected {len(envs)} task assignments, got {len(data)}")
+                labels = [env.sample_new_task(env_name=env_name) for env, env_name in zip(envs, data)]
+                remote.send(labels)
+
+            elif cmd == "reset":
+                obs_list = []
+                info_list = []
+                for env in envs:
+                    obs, info = env.reset()
+                    obs_list.append(obs)
+                    info_list.append(info)
+                remote.send((np.stack(obs_list, axis=0), info_list))
+
+            elif cmd == "step":
+                # data is an action array with shape (local_n, action_dim).
+                if len(data) != len(envs):
+                    raise ValueError(f"Worker expected {len(envs)} actions, got {len(data)}")
+                obs_list = []
+                rewards = []
+                terminated = []
+                truncated = []
+                info_list = []
+                for env, action in zip(envs, data):
+                    obs, reward, term, trunc, info = env.step(action)
+                    obs_list.append(obs)
+                    rewards.append(reward)
+                    terminated.append(term)
+                    truncated.append(trunc)
+                    info_list.append(info)
+                remote.send(
+                    (
+                        np.stack(obs_list, axis=0),
+                        np.asarray(rewards, dtype=np.float32),
+                        np.asarray(terminated, dtype=bool),
+                        np.asarray(truncated, dtype=bool),
+                        info_list,
+                    )
+                )
+
+            elif cmd == "close":
+                for env in envs:
+                    env.close()
+                remote.close()
+                break
+
+            else:
+                raise RuntimeError(f"Unknown worker command: {cmd}")
+
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        tb = traceback.format_exc()
+        try:
+            remote.send(("__error__", tb))
+        except Exception:
+            pass
+    finally:
+        for env in envs:
+            try:
+                env.close()
+            except Exception:
+                pass
+
+
+class SubprocTaskVectorEnv:
+    """Vector env that runs N envs across a smaller number of worker processes.
+
+    Each worker owns a shard/batch of environments and steps those local envs
+    serially. Different workers step in parallel. This is usually better on HPC
+    than one process per env because it avoids spawning 50/100 Python processes
+    and gives you explicit control over CPU usage.
+    """
+
+    def __init__(
+        self,
+        classes,
+        tasks,
+        num_envs,
+        base_seed,
+        mask_goal=True,
+        num_workers=0,
+        start_method="fork",
+    ):
+        self.num_envs = int(num_envs)
+        if self.num_envs <= 0:
+            raise ValueError("num_envs must be positive")
+        self.num_workers = self._resolve_num_workers(num_workers, self.num_envs)
+        self.closed = False
+        self.ctx = mp.get_context(start_method)
+
+        # Split global env indices into contiguous shards. Keeping order makes
+        # outputs align exactly with the input action/task-assignment arrays.
+        all_indices = np.arange(self.num_envs)
+        self.worker_indices = [chunk.astype(int).tolist() for chunk in np.array_split(all_indices, self.num_workers)]
+        self.worker_indices = [chunk for chunk in self.worker_indices if len(chunk) > 0]
+        self.num_workers = len(self.worker_indices)
+
+        self.remotes, self.work_remotes = zip(*[self.ctx.Pipe() for _ in range(self.num_workers)])
+        self.processes = []
+        for remote, work_remote, env_indices in zip(self.remotes, self.work_remotes, self.worker_indices):
+            proc = self.ctx.Process(
+                target=_env_worker,
+                args=(work_remote, remote, classes, tasks, base_seed, mask_goal, env_indices),
+                daemon=True,
+            )
+            proc.start()
+            work_remote.close()
+            self.processes.append(proc)
+
+        self.remotes[0].send(("get_spaces", None))
+        action_space, observation_space = self._recv(self.remotes[0])
+        self.single_action_space = action_space
+        self.single_observation_space = observation_space
+
+    @staticmethod
+    def _resolve_num_workers(num_workers, num_envs):
+        requested = int(num_workers or 0)
+        if requested <= 0:
+            cpu_count = os.cpu_count() or 1
+            slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+            if slurm_cpus:
+                try:
+                    cpu_count = int(slurm_cpus)
+                except ValueError:
+                    pass
+            requested = cpu_count
+        return max(1, min(int(num_envs), requested))
+
+    def _recv(self, remote):
+        msg = remote.recv()
+        if (
+            isinstance(msg, tuple)
+            and len(msg) == 2
+            and isinstance(msg[0], str)
+            and msg[0] == "__error__"
+        ):
+            raise RuntimeError("Environment worker failed:\n" + msg[1])
+        return msg
+
+    def _shard_sequence(self, values):
+        return [[values[i] for i in env_indices] for env_indices in self.worker_indices]
+
+    def sample_new_tasks(self, assigned_classes=None):
+        """Sample/switch one task per env.
+
+        assigned_classes may be None, a list of class names, or a list containing
+        None entries. None means sample a class uniformly inside the env wrapper.
+        Returns a flat list of actual class names in env order.
+        """
+        if assigned_classes is None:
+            assigned_classes = [None] * self.num_envs
+        if len(assigned_classes) != self.num_envs:
+            raise ValueError(f"Expected {self.num_envs} assigned classes, got {len(assigned_classes)}")
+
+        for remote, shard in zip(self.remotes, self._shard_sequence(assigned_classes)):
+            remote.send(("sample", shard))
+        shard_labels = [self._recv(remote) for remote in self.remotes]
+
+        labels = [None] * self.num_envs
+        for env_indices, local_labels in zip(self.worker_indices, shard_labels):
+            for env_idx, label in zip(env_indices, local_labels):
+                labels[env_idx] = label
+        return labels
+
+    def reset(self):
+        for remote in self.remotes:
+            remote.send(("reset", None))
+        results = [self._recv(remote) for remote in self.remotes]
+
+        obs_parts = []
+        info_list = []
+        for obs, local_infos in results:
+            obs_parts.append(obs)
+            info_list.extend(local_infos)
+        return np.concatenate(obs_parts, axis=0), _combine_vector_infos(info_list)
+
+    def step(self, actions):
+        if len(actions) != self.num_envs:
+            raise ValueError(f"Expected actions for {self.num_envs} envs, got {len(actions)}")
+        for remote, env_indices in zip(self.remotes, self.worker_indices):
+            remote.send(("step", actions[env_indices]))
+        results = [self._recv(remote) for remote in self.remotes]
+
+        obs_parts = []
+        reward_parts = []
+        terminated_parts = []
+        truncated_parts = []
+        info_list = []
+        for obs, rewards, terminated, truncated, local_infos in results:
+            obs_parts.append(obs)
+            reward_parts.append(rewards)
+            terminated_parts.append(terminated)
+            truncated_parts.append(truncated)
+            info_list.extend(local_infos)
+
+        return (
+            np.concatenate(obs_parts, axis=0),
+            np.concatenate(reward_parts, axis=0).astype(np.float32),
+            np.concatenate(terminated_parts, axis=0).astype(bool),
+            np.concatenate(truncated_parts, axis=0).astype(bool),
+            _combine_vector_infos(info_list),
+        )
+
+    def close(self):
+        if self.closed:
+            return
+        for remote in self.remotes:
+            try:
+                remote.send(("close", None))
+            except Exception:
+                pass
+        for proc in self.processes:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.terminate()
+        self.closed = True
+
 def make_balanced_class_assignment(class_names, num_envs, rng):
     """Return a shuffled list of class names with near-equal counts."""
     class_names = list(class_names)
@@ -158,16 +424,14 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
     eval_trial_length = args.eval_trial_length
     report_lengths = tuple(args.eval_report_lengths)
 
-    envs = gym.vector.SyncVectorEnv(
-        [
-            make_sampler_env(
-                classes,
-                tasks,
-                args.seed + 10_000 + i,
-                mask_goal=should_mask_goal(args),
-            )
-            for i in range(n)
-        ]
+    envs = SubprocTaskVectorEnv(
+        classes,
+        tasks,
+        num_envs=n,
+        base_seed=args.seed + 10_000,
+        mask_goal=should_mask_goal(args),
+        num_workers=getattr(args, "eval_num_env_workers", 0),
+        start_method=getattr(args, "env_start_method", "fork"),
     )
 
     action_dim = envs.single_action_space.shape[0]
@@ -189,8 +453,7 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
         assigned_classes = assigned_classes[:n]
         np.random.shuffle(assigned_classes)
 
-        for env, env_name in zip(envs.envs, assigned_classes):
-            env.sample_new_task(env_name=env_name)
+        envs.sample_new_tasks(assigned_classes)
 
         raw_obs, _ = envs.reset()
         obs = obs_normalizer.normalize(raw_obs)
@@ -394,6 +657,11 @@ def train():
         f"Task set: {args.task_set} | envs={args.num_envs} | "
         f"trial_length={args.trial_length} | ep_len={args.rollout_steps}"
     )
+    print(
+        f"Env workers: train={getattr(args, 'num_env_workers', 0) or 'auto'} | "
+        f"eval={getattr(args, 'eval_num_env_workers', 0) or 'auto'} | "
+        f"start_method={getattr(args, 'env_start_method', 'fork')}"
+    )
 
     if args.task_set not in ["ML1", "ML10", "ML45"]:
         raise ValueError("This trainer is for ML1/ML10/ML45.")
@@ -410,16 +678,14 @@ def train():
         )
 
     meta_learning = build_metaworld(args)
-    envs = gym.vector.SyncVectorEnv(
-        [
-            make_sampler_env(
-                meta_learning.train_classes,
-                meta_learning.train_tasks,
-                args.seed + i,
-                mask_goal=should_mask_goal(args),
-            )
-            for i in range(args.num_envs)
-        ]
+    envs = SubprocTaskVectorEnv(
+        meta_learning.train_classes,
+        meta_learning.train_tasks,
+        num_envs=args.num_envs,
+        base_seed=args.seed,
+        mask_goal=should_mask_goal(args),
+        num_workers=getattr(args, "num_env_workers", 0),
+        start_method=getattr(args, "env_start_method", "fork"),
     )
 
     train_class_names = list(meta_learning.train_classes.keys())
@@ -610,15 +876,14 @@ def train():
         t0 = time.time()
 
         if args.random_task_sample:
-            assigned_classes = [env.sample_new_task() for env in envs.envs]
+            assigned_classes = envs.sample_new_tasks(None)
         else:
             assigned_classes = make_balanced_class_assignment(
                 train_class_names,
                 args.num_envs,
                 task_assignment_rng,
             )
-            for env, env_name in zip(envs.envs, assigned_classes):
-                env.sample_new_task(env_name=env_name)
+            assigned_classes = envs.sample_new_tasks(assigned_classes)
 
         raw_obs, _ = envs.reset()
         obs_normalizer.update(raw_obs)

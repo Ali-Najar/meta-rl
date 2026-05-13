@@ -35,6 +35,32 @@ def get_args():
     parser.add_argument("--env_name", type=str, default="push-v3")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--num_envs", type=int, default=50, help="Number of parallel environments during training.")
+    parser.add_argument(
+        "--num_env_workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of subprocess workers for train_multicore.py. Each worker owns a batch "
+            "of envs. Use 0 for auto based on SLURM_CPUS_PER_TASK/os.cpu_count. "
+            "Ignored by train.py."
+        ),
+    )
+    parser.add_argument(
+        "--eval_num_env_workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of subprocess workers for evaluation in train_multicore.py. Use 0 for auto. "
+            "Set this lower than --eval_num_tasks to avoid launching too many processes."
+        ),
+    )
+    parser.add_argument(
+        "--env_start_method",
+        type=str,
+        default="fork",
+        choices=["fork", "spawn", "forkserver"],
+        help="Multiprocessing start method used by train_multicore.py.",
+    )
     parser.add_argument("--trial_length", type=int, default=5, help="Episodes per trial and episode-memory slots.")
     parser.add_argument("--rollout_steps", type=int, default=500, help="Steps per episode.")
     parser.add_argument("--random_task_sample", action="store_true", help="Sample training task classes independently instead of balancing per update.")
@@ -119,11 +145,38 @@ def get_args():
             "rollout mean/std. Labels are used only for loss scaling, not as policy inputs."
         ),
     )
+    parser.add_argument(
+        "--normalize_reward_by_class",
+        action="store_true",
+        help=(
+            "Normalize rewards for PPO training targets with one running reward normalizer per task class. "
+            "The policy/TTT prev_reward input still uses the raw environment reward."
+        ),
+    )
+
+    parser.add_argument(
+        "--log_rollout_learning_signal",
+        action="store_true",
+        help=(
+            "Log per-task rollout learning-signal diagnostics to "
+            "rollout_task_learning_signal.csv and print the compact signal table. "
+            "Disabled by default because it adds CSV I/O and extra CPU work."
+        ),
+    )
     parser.add_argument("--clip_epsilon", type=float, default=0.2)
     parser.add_argument("--ent_coef", type=float, default=0.0)
     parser.add_argument("--vf_coef", type=float, default=0.5)
     parser.add_argument("--max_grad_norm", type=float, default=10.0)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument(
+        "--log_ppo_class_diagnostics",
+        action="store_true",
+        help=(
+            "Log per-task-class PPO loss and diagnostic gradient norms to "
+            "ppo_task_class_diagnostics.csv. This is disabled by default because "
+            "it adds extra autograd calls and CSV I/O."
+        ),
+    )
     parser.add_argument("--min_std", type=float, default=0.1)
     parser.add_argument("--max_std", type=float, default=1.5)
     parser.add_argument("--init_std", type=float, default=0.5)
