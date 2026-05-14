@@ -37,7 +37,9 @@ def load_metrics(root: Path):
         # if "mb128" not in run_name:
         #     if "fixed" not in run_name:
         #         continue
-        if "ML10" not in run_name:
+        # if "ML10" not in run_name:
+        #     continue
+        if "ML45" not in run_name:
             continue
         # if "ML1_" not in run_name:
         #     continue

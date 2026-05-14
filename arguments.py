@@ -180,6 +180,30 @@ def get_args():
     parser.add_argument("--min_std", type=float, default=0.1)
     parser.add_argument("--max_std", type=float, default=1.5)
     parser.add_argument("--init_std", type=float, default=0.5)
+    parser.add_argument(
+        "--squash_actions",
+        action="store_true",
+        help=(
+            "Use tanh-squashed Gaussian actions for PPO. The environment receives "
+            "tanh(raw_action), while PPO stores raw pre-tanh actions and uses the "
+            "correct tanh log-probability correction."
+        ),
+    )
+    parser.add_argument(
+        "--squash_logprob_eps",
+        type=float,
+        default=1e-6,
+        help="Numerical epsilon for tanh-squashed Gaussian log-prob correction.",
+    )
+    parser.add_argument(
+        "--action_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale applied after tanh when --squash_actions is set: "
+            "env_action = action_scale * tanh(raw_action). Use <= 1.0."
+        ),
+    )
 
     parser.add_argument("--eval_interval", type=int, default=5, help="Evaluate every N updates.")
     parser.add_argument("--eval_num_tasks", type=int, default=100, help="Sample this many eval variations.")

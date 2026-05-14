@@ -233,6 +233,52 @@ def get_success_array(info, num_envs):
     return successes.astype(bool)
 
 
+
+def tanh_squashed_log_prob(mean, log_std, raw_action, eps=1e-6, action_scale=1.0):
+    """Log probability of action_scale * tanh(raw_action).
+
+    raw_action is the pre-tanh sample from Normal(mean, std).
+    The constant action_scale term is included for the exact transformed
+    density. It cancels in PPO ratios when action_scale is fixed, but keeping
+    it here makes rollout and update log-probs consistent.
+    """
+    std = log_std.exp()
+    dist = torch.distributions.Normal(mean, std)
+    squashed = torch.tanh(raw_action)
+    log_prob = dist.log_prob(raw_action)
+    scale = float(action_scale)
+    if scale <= 0.0:
+        raise ValueError("action_scale must be > 0")
+    correction = torch.log(scale * (1.0 - squashed.pow(2)) + eps)
+    log_prob = log_prob - correction
+    return log_prob.sum(dim=-1)
+
+
+def sample_tanh_squashed_action(mean, log_std, eps=1e-6, action_scale=1.0):
+    """Sample a tanh-squashed Gaussian action.
+
+    Returns:
+        env_action: bounded action in [-action_scale, action_scale]
+        log_prob: corrected log probability of env_action
+        raw_action: pre-tanh action to store for PPO log-prob recomputation
+    """
+    std = log_std.exp()
+    dist = torch.distributions.Normal(mean, std)
+    raw_action = dist.sample()
+    scale = float(action_scale)
+    if scale <= 0.0:
+        raise ValueError("action_scale must be > 0")
+    env_action = scale * torch.tanh(raw_action)
+    log_prob = tanh_squashed_log_prob(
+        mean,
+        log_std,
+        raw_action,
+        eps=eps,
+        action_scale=scale,
+    )
+    return env_action, log_prob, raw_action
+
+
 def compute_gae(rewards, values, dones, next_value, gamma, gae_lambda):
     """GAE over flattened trial time.
 
@@ -277,12 +323,24 @@ def _sequence_loss_terms(
 ):
     """Return PPO loss terms for one already-selected sequence batch."""
     action_dim = mean_sel.shape[-1]
-    dist = torch.distributions.Normal(
-        mean_sel.reshape(-1, action_dim),
-        log_std_sel.reshape(-1, action_dim).exp(),
-    )
-    new_log_probs = dist.log_prob(actions_sel.reshape(-1, action_dim)).sum(dim=-1)
-    entropy = dist.entropy().sum(dim=-1).mean()
+    mean_flat = mean_sel.reshape(-1, action_dim)
+    log_std_flat = log_std_sel.reshape(-1, action_dim)
+    actions_flat = actions_sel.reshape(-1, action_dim)
+    dist = torch.distributions.Normal(mean_flat, log_std_flat.exp())
+    if getattr(args, "squash_actions", False):
+        new_log_probs = tanh_squashed_log_prob(
+            mean_flat,
+            log_std_flat,
+            actions_flat,
+            eps=getattr(args, "squash_logprob_eps", 1e-6),
+            action_scale=getattr(args, "action_scale", 1.0),
+        )
+        # Differential entropy of the base Gaussian is used as the entropy bonus
+        # for a cheap, stable exploration diagnostic/regularizer.
+        entropy = dist.entropy().sum(dim=-1).mean()
+    else:
+        new_log_probs = dist.log_prob(actions_flat).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1).mean()
 
     old_log_probs_flat = old_log_probs_sel.reshape(-1)
     adv_flat = adv_sel.reshape(-1)

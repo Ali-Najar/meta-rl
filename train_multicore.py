@@ -26,6 +26,7 @@ from utils import (
     get_agent_input,
     get_success_array,
     compute_gae,
+    sample_tanh_squashed_action,
     train_ppo,
 )
 
@@ -48,6 +49,67 @@ def _json_safe(value):
         return value.item()
     return value
 
+
+
+
+def _running_mean_std_state(rms):
+    """Serialize RunningMeanStd in a checkpoint-friendly format."""
+    return {
+        "mean": np.asarray(rms.mean, dtype=np.float32).copy(),
+        "var": np.asarray(rms.var, dtype=np.float32).copy(),
+        "count": float(rms.count),
+    }
+
+
+def _reward_normalizer_state(normalizer):
+    """Serialize RewardNormalizer or ClassRewardNormalizer."""
+    if isinstance(normalizer, ClassRewardNormalizer):
+        return {
+            "type": "class",
+            "gamma": float(normalizer.gamma),
+            "normalizers": {
+                str(name): _reward_normalizer_state(sub_normalizer)
+                for name, sub_normalizer in normalizer.normalizers.items()
+            },
+        }
+
+    state = {
+        "type": "global",
+        "gamma": float(normalizer.gamma),
+        "return_rms": _running_mean_std_state(normalizer.return_rms),
+        "returns": None,
+    }
+    if normalizer.returns is not None:
+        state["returns"] = np.asarray(normalizer.returns, dtype=np.float32).copy()
+    return state
+
+
+def save_training_checkpoint(path, model, obs_normalizer, reward_normalizer, args):
+    """Save model weights plus normalizer states.
+
+    obs_normalizer is also saved as obs_normalizer.npz so analysis scripts can
+    load it directly with --obs_norm_npz.
+    """
+    out_dir = os.path.dirname(path)
+    obs_state = _running_mean_std_state(obs_normalizer)
+    reward_state = _reward_normalizer_state(reward_normalizer)
+
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "obs_normalizer": obs_state,
+            "reward_normalizer": reward_state,
+        },
+        path,
+    )
+
+    np.savez(
+        os.path.join(out_dir, "obs_normalizer.npz"),
+        mean=obs_state["mean"],
+        var=obs_state["var"],
+        count=np.asarray(obs_state["count"], dtype=np.float64),
+    )
+    torch.save(reward_state, os.path.join(out_dir, "reward_normalizer.pt"))
 
 def make_run_dir(args):
     """Create an incrementally numbered run directory and save config.json."""
@@ -476,7 +538,10 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
 
                 out = model.act_step(inp_t, obs_t, episode_memory, ep, cache_params)
                 mean, _ = out.policy
-                action_np = mean.cpu().numpy()
+                if args.squash_actions:
+                    action_np = (args.action_scale * torch.tanh(mean)).cpu().numpy().astype(np.float32)
+                else:
+                    action_np = mean.cpu().numpy()
 
                 next_raw_obs, reward, terminated, truncated, info = envs.step(action_np)
                 done = np.logical_or(terminated, truncated)
@@ -927,12 +992,21 @@ def train():
                 with torch.no_grad():
                     out = model.act_step(inp_t, obs_t, episode_memory, ep, cache_params)
                     mean, log_std = out.policy
-                    dist = torch.distributions.Normal(mean, log_std.exp())
-                    action = dist.sample()
-                    log_prob = dist.log_prob(action).sum(dim=-1)
+                    if args.squash_actions:
+                        env_action, log_prob, action = sample_tanh_squashed_action(
+                            mean,
+                            log_std,
+                            eps=args.squash_logprob_eps,
+                            action_scale=args.action_scale,
+                        )
+                    else:
+                        dist = torch.distributions.Normal(mean, log_std.exp())
+                        action = dist.sample()
+                        env_action = action
+                        log_prob = dist.log_prob(action).sum(dim=-1)
                     value = out.value
 
-                action_np = action.cpu().numpy()
+                action_np = env_action.cpu().numpy().astype(np.float32)
                 next_raw_obs, raw_reward, terminated, truncated, info = envs.step(action_np)
                 global_timesteps += B
                 done = np.logical_or(terminated, truncated)
@@ -1198,7 +1272,13 @@ def train():
         with open(csv_path, "a", newline="") as f:
             csv.writer(f).writerow(metrics_row)
 
-    torch.save({"model": model.state_dict()}, os.path.join(out_dir, "ttt_ecet_policy.pth"))
+    save_training_checkpoint(
+        os.path.join(out_dir, "ttt_ecet_policy.pth"),
+        model,
+        obs_normalizer,
+        reward_normalizer,
+        args,
+    )
     envs.close()
 
 
