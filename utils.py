@@ -45,6 +45,68 @@ class GoalMaskedEnv(gym.Wrapper):
 
         return obs[:self.proprio_dim], reward, terminated, truncated, info
 
+def _unwrap_mujoco_env(env):
+    """Best-effort unwrap to the object that owns MuJoCo data/model."""
+    cur = env
+    seen = set()
+    candidates = [env]
+    for _ in range(30):
+        if id(cur) in seen:
+            break
+        seen.add(id(cur))
+        moved = False
+        for attr in ("env", "unwrapped", "_env", "wrapped_env"):
+            if hasattr(cur, attr):
+                try:
+                    nxt = getattr(cur, attr)
+                except Exception:
+                    nxt = None
+                if nxt is not None and id(nxt) not in seen:
+                    candidates.append(nxt)
+                    cur = nxt
+                    moved = True
+                    break
+        if not moved:
+            break
+    for candidate in candidates:
+        if hasattr(candidate, "data") and hasattr(candidate, "model"):
+            return candidate
+    return candidates[-1]
+
+
+def get_mujoco_instability_info(env):
+    """Return qacc/qvel diagnostics from a MuJoCo env if available."""
+    mj = _unwrap_mujoco_env(env)
+    data = getattr(mj, "data", None)
+    info = {
+        "qacc_max_abs": np.nan,
+        "qacc_argmax": -1,
+        "qvel_max_abs": np.nan,
+        "qvel_argmax": -1,
+        "qacc_nonfinite": False,
+        "qvel_nonfinite": False,
+    }
+    if data is None:
+        return info
+
+    for name in ("qacc", "qvel"):
+        arr = getattr(data, name, None)
+        if arr is None:
+            continue
+        arr = np.asarray(arr, dtype=np.float64).reshape(-1)
+        if arr.size == 0:
+            continue
+        finite = np.isfinite(arr)
+        info[f"{name}_nonfinite"] = bool(not finite.all())
+        abs_arr = np.abs(arr)
+        if np.isfinite(abs_arr).any():
+            info[f"{name}_max_abs"] = float(np.nanmax(abs_arr))
+            info[f"{name}_argmax"] = int(np.nanargmax(abs_arr))
+        else:
+            info[f"{name}_max_abs"] = float("inf")
+            info[f"{name}_argmax"] = -1
+    return info
+
 
 class MetaWorldTaskSamplerEnv(gym.Env):
     """A single env that samples Meta-World task classes/variations like ECET.
@@ -114,15 +176,22 @@ class MetaWorldTaskSamplerEnv(gym.Env):
         out = self.env.step(action)
 
         if isinstance(out, tuple) and len(out) == 5:
-            return out
-
-        if isinstance(out, tuple) and len(out) == 4:
+            obs, reward, terminated, truncated, info = out
+        elif isinstance(out, tuple) and len(out) == 4:
             obs, reward, done, info = out
             terminated = bool(done)
             truncated = False
-            return obs, reward, terminated, truncated, info
+        else:
+            raise RuntimeError(f"Unexpected step return format: {type(out)} / {out}")
 
-        raise RuntimeError(f"Unexpected step return format: {type(out)} / {out}")
+        # Attach MuJoCo qacc/qvel diagnostics to info so both SyncVectorEnv and
+        # subprocess workers can report physics explosions back to the trainer.
+        info = dict(info or {})
+        try:
+            info.update(get_mujoco_instability_info(self.env))
+        except Exception:
+            pass
+        return obs, reward, terminated, truncated, info
 
     def render(self):
         return self.env.render()
@@ -169,6 +238,41 @@ class RewardNormalizer:
         self.returns = self.returns * (1.0 - dones)
         return rewards / np.sqrt(self.return_rms.var + 1e-8)
 
+    def normalize_masked(self, rewards, dones, valid_mask):
+        """Normalize rewards while ignoring invalid envs entirely.
+
+        Invalid rewards do not update return_rms, do not update running returns,
+        and are returned as zero. This is used when a MuJoCo QACC/QVEL blow-up
+        happens after env.step(...): the bad transition should not poison reward
+        normalization or PPO targets.
+        """
+        rewards = np.asarray(rewards, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32)
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+
+        if rewards.ndim != 1:
+            raise ValueError(f"RewardNormalizer expects rewards shape (B,), got {rewards.shape}")
+        if dones.shape != rewards.shape:
+            raise ValueError(f"dones shape {dones.shape} must match rewards shape {rewards.shape}")
+        if valid_mask.shape != rewards.shape:
+            raise ValueError(f"valid_mask shape {valid_mask.shape} must match rewards shape {rewards.shape}")
+
+        if self.returns is None or self.returns.shape != rewards.shape:
+            self.returns = np.zeros_like(rewards, dtype=np.float32)
+
+        candidate_returns = self.returns * self.gamma + rewards
+        if valid_mask.any():
+            self.return_rms.update(candidate_returns[valid_mask])
+
+        # Keep invalid envs from carrying corrupted return state forward.
+        self.returns[valid_mask] = candidate_returns[valid_mask] * (1.0 - dones[valid_mask])
+        self.returns[~valid_mask] = 0.0
+
+        normalized = np.zeros_like(rewards, dtype=np.float32)
+        if valid_mask.any():
+            normalized[valid_mask] = rewards[valid_mask] / np.sqrt(self.return_rms.var + 1e-8)
+        return normalized
+
 
 
 class ClassRewardNormalizer:
@@ -207,6 +311,37 @@ class ClassRewardNormalizer:
             normalized[mask] = self.normalizers[key].normalize(rewards[mask], dones[mask])
         return normalized
 
+    def normalize_masked(self, rewards, dones, task_classes, valid_mask):
+        """Class-wise reward normalization that fully ignores invalid envs."""
+        rewards = np.asarray(rewards, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32)
+        task_classes = np.asarray(task_classes, dtype=object)
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+
+        if rewards.ndim != 1:
+            raise ValueError(f"ClassRewardNormalizer expects rewards shape (B,), got {rewards.shape}")
+        if dones.shape != rewards.shape:
+            raise ValueError(f"dones shape {dones.shape} must match rewards shape {rewards.shape}")
+        if valid_mask.shape != rewards.shape:
+            raise ValueError(f"valid_mask shape {valid_mask.shape} must match rewards shape {rewards.shape}")
+        if task_classes.shape[0] != rewards.shape[0]:
+            raise ValueError(
+                f"task_classes length {task_classes.shape[0]} must match rewards length {rewards.shape[0]}"
+            )
+
+        normalized = np.zeros_like(rewards, dtype=np.float32)
+        for cls in sorted(set(task_classes.tolist())):
+            mask = task_classes == cls
+            key = str(cls)
+            if key not in self.normalizers:
+                self.normalizers[key] = RewardNormalizer(gamma=self.gamma)
+            normalized[mask] = self.normalizers[key].normalize_masked(
+                rewards[mask],
+                dones[mask],
+                valid_mask[mask],
+            )
+        return normalized
+
 
 
 def get_agent_input(obs, prev_action, prev_reward, prev_done, agent_mode):
@@ -231,6 +366,40 @@ def get_success_array(info, num_envs):
     if np.isscalar(successes):
         successes = np.full(num_envs, bool(successes))
     return successes.astype(bool)
+
+
+def _vector_info_array(info, key, num_envs, default):
+    value = info.get(key, info.get("_" + key, default))
+    if isinstance(value, list):
+        value = np.asarray(value)
+    if np.isscalar(value):
+        value = np.full(num_envs, value)
+    value = np.asarray(value)
+    if value.shape == ():
+        value = np.full(num_envs, value.item())
+    if value.shape[0] != num_envs:
+        value = np.resize(value, num_envs)
+    return value
+
+
+def get_qacc_bad_array(info, num_envs, qacc_threshold=1e6, qvel_threshold=1e5):
+    """Return per-env MuJoCo instability flags from vectorized info.
+
+    A trajectory is considered bad if qacc or qvel is non-finite, or if the
+    max absolute qacc/qvel exceeds the requested thresholds.
+    """
+    qacc = _vector_info_array(info, "qacc_max_abs", num_envs, np.nan).astype(np.float64)
+    qvel = _vector_info_array(info, "qvel_max_abs", num_envs, np.nan).astype(np.float64)
+    qacc_nonfinite = _vector_info_array(info, "qacc_nonfinite", num_envs, False).astype(bool)
+    qvel_nonfinite = _vector_info_array(info, "qvel_nonfinite", num_envs, False).astype(bool)
+    qacc_argmax = _vector_info_array(info, "qacc_argmax", num_envs, -1).astype(np.int64)
+
+    bad = qacc_nonfinite | qvel_nonfinite
+    bad |= np.isfinite(qacc) & (qacc > float(qacc_threshold))
+    bad |= np.isfinite(qvel) & (qvel > float(qvel_threshold))
+    bad |= ~np.isfinite(qacc) & ~np.isnan(qacc)
+    bad |= ~np.isfinite(qvel) & ~np.isnan(qvel)
+    return bad.astype(bool), qacc, qacc_argmax
 
 
 

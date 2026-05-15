@@ -25,7 +25,6 @@ from utils import (
     ClassRewardNormalizer,
     get_agent_input,
     get_success_array,
-    get_qacc_bad_array,
     compute_gae,
     sample_tanh_squashed_action,
     train_ppo,
@@ -53,64 +52,170 @@ def _json_safe(value):
 
 
 
-def _running_mean_std_state(rms):
-    """Serialize RunningMeanStd in a checkpoint-friendly format."""
-    return {
-        "mean": np.asarray(rms.mean, dtype=np.float32).copy(),
-        "var": np.asarray(rms.var, dtype=np.float32).copy(),
-        "count": float(rms.count),
-    }
+def save_action_histograms(
+    out_dir,
+    csv_path,
+    update,
+    timestep,
+    env_actions,
+    valid_mask,
+    bins=80,
+    hist_range=(-1.0, 1.0),
+):
+    """Save per-update histograms of executed env actions.
 
-
-def _reward_normalizer_state(normalizer):
-    """Serialize RewardNormalizer or ClassRewardNormalizer."""
-    if isinstance(normalizer, ClassRewardNormalizer):
-        return {
-            "type": "class",
-            "gamma": float(normalizer.gamma),
-            "normalizers": {
-                str(name): _reward_normalizer_state(sub_normalizer)
-                for name, sub_normalizer in normalizer.normalizers.items()
-            },
-        }
-
-    state = {
-        "type": "global",
-        "gamma": float(normalizer.gamma),
-        "return_rms": _running_mean_std_state(normalizer.return_rms),
-        "returns": None,
-    }
-    if normalizer.returns is not None:
-        state["returns"] = np.asarray(normalizer.returns, dtype=np.float32).copy()
-    return state
-
-
-def save_training_checkpoint(path, model, obs_normalizer, reward_normalizer, args):
-    """Save model weights plus normalizer states.
-
-    obs_normalizer is also saved as obs_normalizer.npz so analysis scripts can
-    load it directly with --obs_norm_npz.
+    env_actions: np.ndarray or torch tensor, shape (B, E, T, action_dim)
+        The actual action sent to env.step(...). For squashed policies this is
+        action_scale * tanh(raw_action), not the pre-tanh action.
+    valid_mask: np.ndarray or torch tensor, shape (B, E, T)
+        1 for collected rollout positions.
     """
-    out_dir = os.path.dirname(path)
-    obs_state = _running_mean_std_state(obs_normalizer)
-    reward_state = _reward_normalizer_state(reward_normalizer)
+    if torch.is_tensor(env_actions):
+        env_actions = env_actions.detach().cpu().numpy()
+    if torch.is_tensor(valid_mask):
+        valid_mask = valid_mask.detach().cpu().numpy()
 
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "obs_normalizer": obs_state,
-            "reward_normalizer": reward_state,
-        },
-        path,
+    env_actions = np.asarray(env_actions, dtype=np.float32)
+    valid_mask = np.asarray(valid_mask).astype(bool)
+
+    if env_actions.ndim != 4:
+        raise ValueError(f"env_actions must have shape (B,E,T,D), got {env_actions.shape}")
+    if valid_mask.shape != env_actions.shape[:3]:
+        raise ValueError(f"valid_mask shape {valid_mask.shape} does not match env_actions {env_actions.shape[:3]}")
+
+    action_dim = env_actions.shape[-1]
+    flat_actions = env_actions[valid_mask]  # (N, action_dim)
+    if flat_actions.size == 0:
+        return
+
+    hist_dir = os.path.join(out_dir, "action_histograms")
+    os.makedirs(hist_dir, exist_ok=True)
+
+    bin_edges = np.linspace(float(hist_range[0]), float(hist_range[1]), int(bins) + 1)
+    counts = np.zeros((action_dim, int(bins)), dtype=np.int64)
+    density = np.zeros((action_dim, int(bins)), dtype=np.float64)
+
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(
+                [
+                    "update",
+                    "timestep",
+                    "action_dim",
+                    "bin_left",
+                    "bin_right",
+                    "count",
+                    "density",
+                    "num_samples",
+                    "mean",
+                    "std",
+                    "min",
+                    "max",
+                    "abs_mean",
+                    "abs_max",
+                    "below_hist_min_frac",
+                    "above_hist_max_frac",
+                    "sat_095_frac",
+                    "sat_099_frac",
+                ]
+            )
+
+        for dim in range(action_dim):
+            x = flat_actions[:, dim].astype(np.float64)
+            finite = np.isfinite(x)
+            x = x[finite]
+            if x.size == 0:
+                continue
+
+            c, _ = np.histogram(x, bins=bin_edges)
+            d, _ = np.histogram(x, bins=bin_edges, density=True)
+            d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+
+            counts[dim] = c
+            density[dim] = d
+
+            num_samples = int(x.size)
+            mean = float(x.mean())
+            std = float(x.std())
+            xmin = float(x.min())
+            xmax = float(x.max())
+            abs_x = np.abs(x)
+            abs_mean = float(abs_x.mean())
+            abs_max = float(abs_x.max())
+            below_frac = float(np.mean(x < hist_range[0]))
+            above_frac = float(np.mean(x > hist_range[1]))
+            sat_095_frac = float(np.mean(abs_x > 0.95))
+            sat_099_frac = float(np.mean(abs_x > 0.99))
+
+            for i in range(int(bins)):
+                writer.writerow(
+                    [
+                        update,
+                        timestep,
+                        dim,
+                        float(bin_edges[i]),
+                        float(bin_edges[i + 1]),
+                        int(c[i]),
+                        float(d[i]),
+                        num_samples,
+                        mean,
+                        std,
+                        xmin,
+                        xmax,
+                        abs_mean,
+                        abs_max,
+                        below_frac,
+                        above_frac,
+                        sat_095_frac,
+                        sat_099_frac,
+                    ]
+                )
+
+    np.savez_compressed(
+        os.path.join(hist_dir, f"action_hist_update_{int(update):04d}.npz"),
+        update=np.asarray(update, dtype=np.int64),
+        timestep=np.asarray(timestep, dtype=np.int64),
+        bin_edges=bin_edges,
+        counts=counts,
+        density=density,
+        hist_range=np.asarray(hist_range, dtype=np.float64),
     )
 
-    np.savez(
-        os.path.join(out_dir, "obs_normalizer.npz"),
-        mean=obs_state["mean"],
-        var=obs_state["var"],
-        count=np.asarray(obs_state["count"], dtype=np.float64),
-    )
-    torch.save(reward_state, os.path.join(out_dir, "reward_normalizer.pt"))
+    # Best-effort plot. If matplotlib is not available on the HPC node, the CSV
+    # and NPZ histogram data are still saved.
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        ncols = 2
+        nrows = int(np.ceil(action_dim / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 3.5 * nrows), squeeze=False)
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        width = bin_edges[1] - bin_edges[0]
+
+        for dim in range(action_dim):
+            ax = axes[dim // ncols][dim % ncols]
+            ax.bar(centers, counts[dim], width=width, align="center")
+            ax.set_title(f"action dim {dim}")
+            ax.set_xlabel("executed env action")
+            ax.set_ylabel("count")
+            ax.set_xlim(hist_range[0], hist_range[1])
+            ax.grid(True, alpha=0.25)
+
+        for dim in range(action_dim, nrows * ncols):
+            axes[dim // ncols][dim % ncols].axis("off")
+
+        fig.suptitle(f"Executed action histograms | update {update} | timestep {timestep}")
+        fig.tight_layout()
+        fig.savefig(os.path.join(hist_dir, f"action_hist_update_{int(update):04d}.png"), dpi=160)
+        plt.close(fig)
+    except Exception as exc:
+        if update == 1:
+            print(f"Action histogram plotting disabled: {exc}")
+
 
 def make_run_dir(args):
     """Create an incrementally numbered run directory and save config.json."""
@@ -219,20 +324,6 @@ def _env_worker(remote, parent_remote, classes, tasks, base_seed, mask_goal, env
                     obs_list.append(obs)
                     info_list.append(info)
                 remote.send((np.stack(obs_list, axis=0), info_list))
-
-            elif cmd == "reset_indices":
-                # data is a list of local env positions owned by this worker.
-                obs_list = []
-                info_list = []
-                local_indices = [int(i) for i in data]
-                for local_idx in local_indices:
-                    obs, info = envs[local_idx].reset()
-                    obs_list.append(obs)
-                    info_list.append(info)
-                if obs_list:
-                    remote.send((local_indices, np.stack(obs_list, axis=0), info_list))
-                else:
-                    remote.send((local_indices, None, info_list))
 
             elif cmd == "step":
                 # data is an action array with shape (local_n, action_dim).
@@ -397,32 +488,6 @@ class SubprocTaskVectorEnv:
             info_list.extend(local_infos)
         return np.concatenate(obs_parts, axis=0), _combine_vector_infos(info_list)
 
-    def reset_indices(self, indices):
-        """Reset selected global env indices and return {env_index: raw_obs}."""
-        indices = sorted(set(int(i) for i in indices))
-        if len(indices) == 0:
-            return {}
-
-        index_set = set(indices)
-        requests = []
-        for remote, env_indices in zip(self.remotes, self.worker_indices):
-            local_positions = [
-                local_pos
-                for local_pos, global_idx in enumerate(env_indices)
-                if global_idx in index_set
-            ]
-            requests.append(local_positions)
-            remote.send(("reset_indices", local_positions))
-
-        results = [self._recv(remote) for remote in self.remotes]
-        reset_obs = {}
-        for env_indices, (local_positions, obs_array, _info_list) in zip(self.worker_indices, results):
-            if obs_array is None:
-                continue
-            for row_idx, local_pos in enumerate(local_positions):
-                reset_obs[int(env_indices[local_pos])] = obs_array[row_idx]
-        return reset_obs
-
     def step(self, actions):
         if len(actions) != self.num_envs:
             raise ValueError(f"Expected actions for {self.num_envs} envs, got {len(actions)}")
@@ -463,29 +528,6 @@ class SubprocTaskVectorEnv:
             if proc.is_alive():
                 proc.terminate()
         self.closed = True
-
-
-
-def reset_vector_env_indices(envs, indices):
-    """Reset selected vector-env indices and return {env_index: raw_obs}.
-
-    For SyncVectorEnv we directly reset envs.envs[i]. For SubprocTaskVectorEnv
-    this delegates to reset_indices(...). Reset observations are intentionally
-    not used to update obs_normalizer when the reset was caused by QACC/QVEL.
-    """
-    indices = [int(i) for i in indices]
-    if len(indices) == 0:
-        return {}
-
-    if hasattr(envs, "reset_indices"):
-        return envs.reset_indices(indices)
-
-    reset_obs = {}
-    for idx in indices:
-        raw_obs, _ = envs.envs[idx].reset()
-        reset_obs[idx] = raw_obs
-    return reset_obs
-
 
 def make_balanced_class_assignment(class_names, num_envs, rng):
     """Return a shuffled list of class names with near-equal counts."""
@@ -543,13 +585,7 @@ def build_metaworld(args):
 
 @torch.no_grad()
 def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=device):
-    """Run one max-length eval trial and summarize arbitrary prefixes.
-
-    When --drop_qacc_trajectories is enabled, eval trajectories that hit
-    QACC/QVEL/non-finite-observation instability are reset immediately and
-    excluded from eval summaries. This prevents a single corrupted simulator
-    state from looking like a sudden policy-performance collapse.
-    """
+    """Run one max-length eval trial and summarize arbitrary prefixes."""
     classes = meta_learning.test_classes
     tasks = meta_learning.test_tasks
     n = args.eval_num_tasks
@@ -576,8 +612,6 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
 
     returns = np.zeros((args.eval_num_trials, n, eval_trial_length), dtype=np.float32)
     successes = np.zeros((args.eval_num_trials, n, eval_trial_length), dtype=bool)
-    eval_valid = np.ones((args.eval_num_trials, n), dtype=bool)
-    eval_qacc_bad_any = np.zeros((args.eval_num_trials, n), dtype=bool)
     detailed_rows = []
 
     for eval_round in range(args.eval_num_trials):
@@ -596,7 +630,6 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
         prev_reward = np.zeros((n, 1), dtype=np.float32)
         prev_done = np.zeros((n, 1), dtype=np.float32)
         cumulative_any = np.zeros(n, dtype=bool)
-        eval_bad_envs = np.zeros(n, dtype=bool)
 
         for ep in range(eval_trial_length):
             ep_rewards = np.zeros(n, dtype=np.float32)
@@ -616,71 +649,23 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
                 else:
                     action_np = mean.cpu().numpy()
 
-                if args.drop_qacc_trajectories and eval_bad_envs.any():
-                    action_np[eval_bad_envs] = 0.0
-                active_before = ~eval_bad_envs if args.drop_qacc_trajectories else np.ones(n, dtype=bool)
-
                 next_raw_obs, reward, terminated, truncated, info = envs.step(action_np)
                 done = np.logical_or(terminated, truncated)
-                success = get_success_array(info, n)
-
-                step_valid_mask = np.ones(n, dtype=bool)
-                qacc_bad = np.zeros(n, dtype=bool)
-                bad_now = np.zeros(n, dtype=bool)
-                if args.drop_qacc_trajectories:
-                    qacc_bad, _qacc_max, _qacc_argmax = get_qacc_bad_array(
-                        info,
-                        n,
-                        qacc_threshold=args.qacc_threshold,
-                        qvel_threshold=args.qvel_threshold,
-                    )
-                    obs_bad = ~np.isfinite(next_raw_obs).all(axis=1)
-                    bad_now = active_before & (qacc_bad | obs_bad)
-                    step_valid_mask = active_before & ~bad_now
-
-                    if bad_now.any():
-                        bad_indices = np.nonzero(bad_now)[0].astype(int).tolist()
-                        reset_obs = reset_vector_env_indices(envs, bad_indices)
-                        next_raw_obs = np.asarray(next_raw_obs, dtype=np.float32).copy()
-                        for env_idx, reset_raw_obs in reset_obs.items():
-                            next_raw_obs[env_idx] = reset_raw_obs
-                        eval_bad_envs = np.logical_or(eval_bad_envs, bad_now)
-                        eval_valid[eval_round, bad_now] = False
-                        eval_qacc_bad_any[eval_round, bad_now] = qacc_bad[bad_now]
-
-                    reward = np.asarray(reward, dtype=np.float32).copy()
-                    done = np.asarray(done, dtype=bool).copy()
-                    success = np.asarray(success, dtype=bool).copy()
-                    reward[~step_valid_mask] = 0.0
-                    done[eval_bad_envs] = False
-                    success[~step_valid_mask] = False
-
-                ep_rewards += np.where(step_valid_mask, reward, 0.0)
-                ep_success = np.logical_or(ep_success, success & step_valid_mask)
+                ep_rewards += reward
+                ep_success = np.logical_or(ep_success, get_success_array(info, n))
 
                 cache_params = out.cache_params
                 prev_action = action_np
                 prev_reward = reward[:, None]
                 prev_done = done[:, None].astype(np.float32)
-                if args.drop_qacc_trajectories and eval_bad_envs.any():
-                    prev_action[eval_bad_envs] = 0.0
-                    prev_reward[eval_bad_envs] = 0.0
-                    prev_done[eval_bad_envs] = 0.0
                 obs = obs_normalizer.normalize(next_raw_obs)
 
-                if args.drop_qacc_trajectories:
-                    if np.logical_or(done, eval_bad_envs).all():
-                        break
-                elif done.all():
+                if done.all():
                     break
 
             if out is None:
                 raise RuntimeError("Evaluation episode produced no rollout steps.")
-            hidden_to_store = out.hidden_states.detach()
-            if args.drop_qacc_trajectories and eval_bad_envs.any():
-                hidden_to_store = hidden_to_store.clone()
-                hidden_to_store[torch.tensor(eval_bad_envs, dtype=torch.bool, device=device)] = 0.0
-            episode_memory[:, ep, :] = hidden_to_store
+            episode_memory[:, ep, :] = out.hidden_states.detach()
             returns[eval_round, :, ep] = ep_rewards
             successes[eval_round, :, ep] = ep_success
             cumulative_any = np.logical_or(cumulative_any, ep_success)
@@ -696,8 +681,6 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
                         "episode_return": float(ep_rewards[env_idx]),
                         "episode_success": int(ep_success[env_idx]),
                         "cum_anysuccess": int(cumulative_any[env_idx]),
-                        "eval_valid": int(eval_valid[eval_round, env_idx]),
-                        "eval_qacc_bad": int(eval_qacc_bad_any[eval_round, env_idx]),
                     }
                 )
 
@@ -711,19 +694,11 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
     envs.close()
 
     summaries = {}
-    valid_eval_mask = eval_valid
-    invalid_count = int((~valid_eval_mask).sum())
-    if args.drop_qacc_trajectories and invalid_count > 0:
-        print(f"Eval: excluding {invalid_count}/{valid_eval_mask.size} trajectories with QACC/QVEL/non-finite obs.")
-
     print("Eval adaptation curve from one max-length rollout:")
     for ep in range(eval_trial_length):
-        ep_returns = returns[:, :, ep][valid_eval_mask]
-        ep_successes = successes[:, :, ep][valid_eval_mask]
-        ep_any = successes[:, :, : ep + 1].any(axis=2)[valid_eval_mask]
-        mean_ret = float(ep_returns.mean()) if ep_returns.size > 0 else float("nan")
-        mean_succ = float(ep_successes.mean()) if ep_successes.size > 0 else float("nan")
-        cum_any = float(ep_any.mean()) if ep_any.size > 0 else float("nan")
+        mean_ret = float(returns[:, :, ep].mean())
+        mean_succ = float(successes[:, :, ep].mean())
+        cum_any = float(successes[:, :, : ep + 1].any(axis=2).mean())
         print(
             f"  ep {ep + 1:02d}: return={mean_ret:.2f}, "
             f"success={100 * mean_succ:.1f}%, any<=ep={100 * cum_any:.1f}%"
@@ -737,24 +712,11 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
         any_successes = prefix_successes.any(axis=2)
 
         prefix = f"eval_len_{length}"
-        trial_returns = prefix_returns.sum(axis=2)[valid_eval_mask]
-        summaries[f"{prefix}_trial_return"] = float(trial_returns.mean()) if trial_returns.size > 0 else float("nan")
-        valid_final_returns = final_returns[valid_eval_mask]
-        summaries[f"{prefix}_final_return"] = (
-            float(valid_final_returns.mean()) if valid_final_returns.size > 0 else float("nan")
-        )
-        valid_final_successes = final_successes[valid_eval_mask]
-        summaries[f"{prefix}_final_success"] = (
-            float(valid_final_successes.mean()) if valid_final_successes.size > 0 else float("nan")
-        )
-        valid_any_successes = any_successes[valid_eval_mask]
-        summaries[f"{prefix}_anysuccess"] = (
-            float(valid_any_successes.mean()) if valid_any_successes.size > 0 else float("nan")
-        )
-        valid_prefix_successes = prefix_successes[valid_eval_mask]
-        summaries[f"{prefix}_mean_ep_success"] = (
-            float(valid_prefix_successes.mean()) if valid_prefix_successes.size > 0 else float("nan")
-        )
+        summaries[f"{prefix}_trial_return"] = float(prefix_returns.sum(axis=2).mean())
+        summaries[f"{prefix}_final_return"] = float(final_returns.mean())
+        summaries[f"{prefix}_final_success"] = float(final_successes.mean())
+        summaries[f"{prefix}_anysuccess"] = float(any_successes.mean())
+        summaries[f"{prefix}_mean_ep_success"] = float(prefix_successes.mean())
 
         print(
             f"Eval prefix {length}: "
@@ -766,6 +728,7 @@ def evaluate_meta_learning(model, meta_learning, obs_normalizer, args, device=de
         )
 
     return summaries, detailed_rows
+
 
 def compute_learning_signal_by_class(
     assigned_classes,
@@ -1033,8 +996,6 @@ def train():
                 "episode_return",
                 "episode_success",
                 "cum_anysuccess",
-                "eval_valid",
-                "eval_qacc_bad",
             ]
         )
 
@@ -1075,22 +1036,7 @@ def train():
         with open(ppo_class_csv_path, "w", newline="") as f:
             csv.writer(f).writerow(ppo_class_header)
 
-    qacc_drop_csv_path = None
-    if args.drop_qacc_trajectories:
-        qacc_drop_csv_path = os.path.join(out_dir, "dropped_qacc_trajectories.csv")
-        with open(qacc_drop_csv_path, "w", newline="") as f:
-            csv.writer(f).writerow(
-                [
-                    "update",
-                    "timestep",
-                    "num_dropped",
-                    "num_kept",
-                    "dropped_env_indices",
-                    "dropped_env_names",
-                    "qacc_max_abs",
-                    "qacc_argmax",
-                ]
-            )
+    action_hist_csv_path = os.path.join(out_dir, "action_histograms.csv")
 
     raw_obs, _ = envs.reset()
     obs_normalizer.update(raw_obs)
@@ -1120,6 +1066,7 @@ def train():
         b_inputs = torch.zeros((B, E, T, input_dim), device=device)
         b_states = torch.zeros((B, E, T, obs_dim), device=device)
         b_actions = torch.zeros((B, E, T, action_dim), device=device)
+        b_env_actions = torch.zeros((B, E, T, action_dim), device=device)
         b_logprobs = torch.zeros((B, E, T), device=device)
         b_rewards = torch.zeros((B, E, T), device=device)
         b_dones = torch.zeros((B, E, T), device=device)
@@ -1137,9 +1084,6 @@ def train():
         prev_done = np.zeros((B, 1), dtype=np.float32)
         trial_ep_rewards = np.zeros((B, E), dtype=np.float32)
         trial_ep_successes = np.zeros((B, E), dtype=bool)
-        qacc_bad_envs = np.zeros(B, dtype=bool)
-        qacc_bad_max = np.zeros(B, dtype=np.float64)
-        qacc_bad_argmax = np.full(B, -1, dtype=np.int64)
 
         for ep in range(E):
             cache_params = None
@@ -1172,110 +1116,43 @@ def train():
                     value = out.value
 
                 action_np = env_action.cpu().numpy().astype(np.float32)
-                if args.drop_qacc_trajectories and qacc_bad_envs.any():
-                    # Already-dropped envs are kept alive only to satisfy the vector env.
-                    # Send zero actions so a corrupted/dropped env cannot keep slamming contacts.
-                    action_np[qacc_bad_envs] = 0.0
-
-                active_before = ~qacc_bad_envs if args.drop_qacc_trajectories else np.ones(B, dtype=bool)
                 next_raw_obs, raw_reward, terminated, truncated, info = envs.step(action_np)
                 global_timesteps += B
                 done = np.logical_or(terminated, truncated)
                 success = get_success_array(info, B)
 
-                step_valid_mask = np.ones(B, dtype=bool)
-                if args.drop_qacc_trajectories:
-                    qacc_bad, qacc_max, qacc_argmax = get_qacc_bad_array(
-                        info,
-                        B,
-                        qacc_threshold=args.qacc_threshold,
-                        qvel_threshold=args.qvel_threshold,
+                ep_rewards += raw_reward
+                ep_success = np.logical_or(ep_success, success)
+                obs_normalizer.update(next_raw_obs)
+                if args.normalize_reward_by_class:
+                    norm_reward = reward_normalizer.normalize(
+                        raw_reward,
+                        done.astype(np.float32),
+                        assigned_classes,
                     )
-                    obs_bad = ~np.isfinite(next_raw_obs).all(axis=1)
-                    bad_now = active_before & (qacc_bad | obs_bad)
-                    qacc_bad_envs = np.logical_or(qacc_bad_envs, bad_now)
-                    step_valid_mask = active_before & ~bad_now
-
-                    qacc_max_clean = np.nan_to_num(qacc_max, nan=0.0, posinf=np.inf, neginf=np.inf)
-                    qacc_bad_max = np.maximum(qacc_bad_max, qacc_max_clean)
-                    qacc_bad_argmax = np.where(qacc_bad | obs_bad, qacc_argmax, qacc_bad_argmax)
-
-                    if bad_now.any():
-                        bad_indices = np.nonzero(bad_now)[0].astype(int).tolist()
-                        reset_obs = reset_vector_env_indices(envs, bad_indices)
-                        next_raw_obs = np.asarray(next_raw_obs, dtype=np.float32).copy()
-                        for env_idx, reset_raw_obs in reset_obs.items():
-                            next_raw_obs[env_idx] = reset_raw_obs
-
-                        # The bad transition is not a training sample and should not
-                        # poison rewards, dones, success metrics, or prev_reward.
-                        raw_reward = np.asarray(raw_reward, dtype=np.float32).copy()
-                        done = np.asarray(done, dtype=bool).copy()
-                        success = np.asarray(success, dtype=bool).copy()
-                        raw_reward[bad_now] = 0.0
-                        done[bad_now] = False
-                        success[bad_now] = False
-
-                ep_rewards += np.where(step_valid_mask, raw_reward, 0.0)
-                ep_success = np.logical_or(ep_success, success & step_valid_mask)
-
-                if args.drop_qacc_trajectories:
-                    if step_valid_mask.any():
-                        obs_normalizer.update(next_raw_obs[step_valid_mask])
-                    if args.normalize_reward_by_class:
-                        norm_reward = reward_normalizer.normalize_masked(
-                            raw_reward,
-                            done.astype(np.float32),
-                            assigned_classes,
-                            step_valid_mask,
-                        )
-                    else:
-                        norm_reward = reward_normalizer.normalize_masked(
-                            raw_reward,
-                            done.astype(np.float32),
-                            step_valid_mask,
-                        )
                 else:
-                    obs_normalizer.update(next_raw_obs)
-                    if args.normalize_reward_by_class:
-                        norm_reward = reward_normalizer.normalize(
-                            raw_reward,
-                            done.astype(np.float32),
-                            assigned_classes,
-                        )
-                    else:
-                        norm_reward = reward_normalizer.normalize(raw_reward, done.astype(np.float32))
+                    norm_reward = reward_normalizer.normalize(raw_reward, done.astype(np.float32))
 
                 b_actions[:, ep, step, :] = action
+                b_env_actions[:, ep, step, :] = env_action
                 b_logprobs[:, ep, step] = log_prob
                 b_rewards[:, ep, step] = torch.tensor(norm_reward, dtype=torch.float32, device=device)
                 b_dones[:, ep, step] = torch.tensor(done, dtype=torch.float32, device=device)
                 b_values[:, ep, step] = value
-                b_valid[:, ep, step] = torch.tensor(step_valid_mask.astype(np.float32), dtype=torch.float32, device=device)
+                b_valid[:, ep, step] = 1.0
 
                 cache_params = out.cache_params
                 prev_action = action_np
                 prev_reward = raw_reward[:, None]
                 prev_done = done[:, None].astype(np.float32)
-                if args.drop_qacc_trajectories and qacc_bad_envs.any():
-                    prev_action[qacc_bad_envs] = 0.0
-                    prev_reward[qacc_bad_envs] = 0.0
-                    prev_done[qacc_bad_envs] = 0.0
                 obs = obs_normalizer.normalize(next_raw_obs)
 
-                if args.drop_qacc_trajectories:
-                    if np.logical_or(done, qacc_bad_envs).all():
-                        break
-                elif done.all():
+                if done.all():
                     break
 
             if out is None:
                 raise RuntimeError("Training episode produced no rollout steps.")
-            hidden_to_store = out.hidden_states.detach()
-            if args.drop_qacc_trajectories and qacc_bad_envs.any():
-                hidden_to_store = hidden_to_store.clone()
-                hidden_to_store[torch.tensor(qacc_bad_envs, dtype=torch.bool, device=device)] = 0.0
-            episode_memory[:, ep, :] = hidden_to_store
+            episode_memory[:, ep, :] = out.hidden_states.detach()
             trial_ep_rewards[:, ep] = ep_rewards
             trial_ep_successes[:, ep] = ep_success
             global_episodes += B
@@ -1289,83 +1166,38 @@ def train():
 
         data_time = time.time() - t0
 
-        train_env_mask_np = np.ones(B, dtype=bool)
-        if args.drop_qacc_trajectories:
-            train_env_mask_np = ~qacc_bad_envs
-            num_dropped = int(qacc_bad_envs.sum())
-            if num_dropped > 0:
-                dropped_indices = np.nonzero(qacc_bad_envs)[0].astype(int).tolist()
-                dropped_names = [assigned_classes[i] for i in dropped_indices]
-                kept = int(train_env_mask_np.sum())
-                print(
-                    f"Dropping {num_dropped}/{B} env trajectories from PPO because of QACC/QVEL instability: "
-                    f"{dropped_names}"
-                )
-                with open(qacc_drop_csv_path, "a", newline="") as f:
-                    csv.writer(f).writerow(
-                        [
-                            update + 1,
-                            global_timesteps,
-                            num_dropped,
-                            kept,
-                            json.dumps(dropped_indices),
-                            json.dumps(dropped_names),
-                            json.dumps([float(qacc_bad_max[i]) for i in dropped_indices]),
-                            json.dumps([int(qacc_bad_argmax[i]) for i in dropped_indices]),
-                        ]
-                    )
+        save_action_histograms(
+            out_dir=out_dir,
+            csv_path=action_hist_csv_path,
+            update=update + 1,
+            timestep=global_timesteps,
+            env_actions=b_env_actions,
+            valid_mask=b_valid,
+            bins=80,
+            hist_range=(-1.0, 1.0),
+        )
 
-        train_env_mask = torch.tensor(train_env_mask_np, dtype=torch.bool, device=device)
-        train_B = int(train_env_mask_np.sum())
+        with torch.no_grad():
+            next_value = torch.zeros(B, device=device)
+        b_adv, b_returns = compute_gae(
+            b_rewards,
+            b_values,
+            b_dones,
+            next_value,
+            args.gamma,
+            args.gae_lambda,
+        )
 
-        if train_B > 0:
-            b_inputs_train = b_inputs[train_env_mask]
-            b_states_train = b_states[train_env_mask]
-            b_actions_train = b_actions[train_env_mask]
-            b_logprobs_train = b_logprobs[train_env_mask]
-            b_rewards_train = b_rewards[train_env_mask]
-            b_dones_train = b_dones[train_env_mask]
-            b_values_train = b_values[train_env_mask]
-            b_valid_train = b_valid[train_env_mask]
-            b_task_ids_train = b_task_ids[train_env_mask]
-
-            with torch.no_grad():
-                next_value = torch.zeros(train_B, device=device)
-            b_adv, b_returns = compute_gae(
-                b_rewards_train,
-                b_values_train,
-                b_dones_train,
-                next_value,
-                args.gamma,
-                args.gae_lambda,
-            )
-
-            train_assigned_classes = [assigned_classes[i] for i, keep in enumerate(train_env_mask_np) if keep]
-            train_trial_ep_rewards = trial_ep_rewards[train_env_mask_np]
-            train_trial_ep_successes = trial_ep_successes[train_env_mask_np]
-        else:
-            b_adv = torch.zeros((0, E, T), device=device)
-            b_returns = torch.zeros((0, E, T), device=device)
-            b_inputs_train = b_inputs[:0]
-            b_states_train = b_states[:0]
-            b_actions_train = b_actions[:0]
-            b_logprobs_train = b_logprobs[:0]
-            b_valid_train = b_valid[:0]
-            b_task_ids_train = b_task_ids[:0]
-            train_assigned_classes = []
-            train_trial_ep_rewards = trial_ep_rewards[:0]
-            train_trial_ep_successes = trial_ep_successes[:0]
-
-        if args.log_rollout_learning_signal and train_B > 0:
+        if args.log_rollout_learning_signal:
             signal_rows = compute_learning_signal_by_class(
-                assigned_classes=train_assigned_classes,
-                trial_ep_rewards=train_trial_ep_rewards,
-                trial_ep_successes=train_trial_ep_successes,
+                assigned_classes=assigned_classes,
+                trial_ep_rewards=trial_ep_rewards,
+                trial_ep_successes=trial_ep_successes,
                 b_adv=b_adv,
                 b_returns=b_returns,
-                b_values=b_values_train,
-                b_logprobs=b_logprobs_train,
-                b_valid=b_valid_train,
+                b_values=b_values,
+                b_logprobs=b_logprobs,
+                b_valid=b_valid if "b_valid" in locals() else None,
             )
 
             with open(rollout_signal_csv_path, "a", newline="") as f:
@@ -1412,29 +1244,19 @@ def train():
                     f"v_mse={row['value_mse']:.3f} "
                     f"ev={row['explained_variance']:.3f}"
                 )
-        elif args.log_rollout_learning_signal:
-            print("Learning signal by task: skipped because all env trajectories were dropped.")
 
         ppo_t0 = time.time()
-        if train_B > 0:
-            rollouts = (
-                b_inputs_train,
-                b_states_train,
-                b_actions_train,
-                b_logprobs_train,
-                b_adv,
-                b_returns,
-                b_valid_train,
-                b_task_ids_train,
-            )
-            loss, p_loss, v_loss, ent, ppo_class_rows = train_ppo(model, optimizer, rollouts, args, device)
-        else:
-            print("Skipping PPO update because all env trajectories were dropped by --drop_qacc_trajectories.")
-            loss = float("nan")
-            p_loss = float("nan")
-            v_loss = float("nan")
-            ent = float("nan")
-            ppo_class_rows = []
+        rollouts = (
+            b_inputs,
+            b_states,
+            b_actions,
+            b_logprobs,
+            b_adv,
+            b_returns,
+            b_valid,
+            b_task_ids,
+        )
+        loss, p_loss, v_loss, ent, ppo_class_rows = train_ppo(model, optimizer, rollouts, args, device)
         ppo_time = time.time() - ppo_t0
 
         if args.log_ppo_class_diagnostics:
@@ -1475,22 +1297,16 @@ def train():
             else:
                 print(f"PPO class diagnostics saved for {len(ppo_class_rows)} classes to {ppo_class_csv_path}")
 
-        if train_B > 0:
-            rollout_trial_return = float(train_trial_ep_rewards.sum(axis=1).mean())
-            rollout_final_return = float(train_trial_ep_rewards[:, -1].mean())
-            rollout_final_success = float(train_trial_ep_successes[:, -1].mean())
-            rollout_anysuccess = float(train_trial_ep_successes.any(axis=1).mean())
-            rollout_task_rows = summarize_rollout_by_task_class(
-                train_assigned_classes,
-                train_trial_ep_rewards,
-                train_trial_ep_successes,
-            )
-        else:
-            rollout_trial_return = float("nan")
-            rollout_final_return = float("nan")
-            rollout_final_success = float("nan")
-            rollout_anysuccess = float("nan")
-            rollout_task_rows = []
+        rollout_trial_return = float(trial_ep_rewards.sum(axis=1).mean())
+        rollout_final_return = float(trial_ep_rewards[:, -1].mean())
+        rollout_final_success = float(trial_ep_successes[:, -1].mean())
+        rollout_anysuccess = float(trial_ep_successes.any(axis=1).mean())
+
+        rollout_task_rows = summarize_rollout_by_task_class(
+            assigned_classes,
+            trial_ep_rewards,
+            trial_ep_successes,
+        )
         with open(rollout_task_csv_path, "a", newline="") as f:
             writer = csv.writer(f)
             for row in rollout_task_rows:
@@ -1558,8 +1374,6 @@ def train():
                             row["episode_return"],
                             row["episode_success"],
                             row["cum_anysuccess"],
-                            row.get("eval_valid", 1),
-                            row.get("eval_qacc_bad", 0),
                         ]
                     )
 
@@ -1579,13 +1393,7 @@ def train():
         with open(csv_path, "a", newline="") as f:
             csv.writer(f).writerow(metrics_row)
 
-    save_training_checkpoint(
-        os.path.join(out_dir, "ttt_ecet_policy.pth"),
-        model,
-        obs_normalizer,
-        reward_normalizer,
-        args,
-    )
+    torch.save({"model": model.state_dict()}, os.path.join(out_dir, "ttt_ecet_policy.pth"))
     envs.close()
 
 

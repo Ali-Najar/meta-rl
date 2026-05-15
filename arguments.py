@@ -74,7 +74,7 @@ def get_args():
 
     parser.add_argument(
         "--context_episode_sample_mode",
-        type=str,
+        type=str,   
         default="uniform",
         choices=["uniform", "recent", "last"],
         help=(
@@ -202,6 +202,33 @@ def get_args():
         help=(
             "Scale applied after tanh when --squash_actions is set: "
             "env_action = action_scale * tanh(raw_action). Use <= 1.0."
+        ),
+    )
+
+    parser.add_argument(
+        "--drop_qacc_trajectories",
+        action="store_true",
+        help=(
+            "If MuJoCo reports a huge/non-finite qacc/qvel for an env during rollout, "
+            "drop that whole env trial from PPO training for this update."
+        ),
+    )
+    parser.add_argument(
+        "--qacc_threshold",
+        type=float,
+        default=1e5,
+        help=(
+            "qacc max-absolute threshold used by --drop_qacc_trajectories. "
+            "1e6 is a conservative 'clear physics blow-up' default; use 1e5 to be stricter."
+        ),
+    )
+    parser.add_argument(
+        "--qvel_threshold",
+        type=float,
+        default=1e4,
+        help=(
+            "qvel max-absolute threshold used by --drop_qacc_trajectories. "
+            "1e4 catches extreme velocity explosions before they poison normalizers."
         ),
     )
 

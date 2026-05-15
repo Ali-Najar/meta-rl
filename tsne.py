@@ -45,7 +45,7 @@ import metaworld
 
 from ttt import TTTConfig
 from agent import TTTEpisodePolicy
-from utils import MetaWorldTaskSamplerEnv, RunningMeanStd, get_agent_input
+from utils import MetaWorldTaskSamplerEnv, RunningMeanStd, get_agent_input, get_success_array
 
 
 def parse_hidden_sizes(x, default=(64, 64)):
@@ -226,6 +226,179 @@ def success_from_info(info):
     return False
 
 
+
+def make_vector_env_for_class(classes, tasks, task_set, class_name, num_envs, seed):
+    """Create a SyncVectorEnv where every env samples the same task class.
+
+    This batches all trials of one task class. SyncVectorEnv is not multi-process,
+    but the policy/TTT forward is batched over trials, which removes the old
+    one-trial-at-a-time model-forward bottleneck.
+    """
+    import gymnasium as gym
+
+    def make_thunk(local_seed):
+        def thunk():
+            env = MetaWorldTaskSamplerEnv(
+                classes,
+                tasks,
+                seed=local_seed,
+                mask_goal=should_mask_goal(task_set),
+            )
+            env.sample_new_task(env_name=class_name)
+            return env
+        return thunk
+
+    return gym.vector.SyncVectorEnv([make_thunk(seed + i) for i in range(num_envs)])
+
+
+@torch.no_grad()
+def rollout_class_vectorized(
+    model,
+    classes,
+    tasks,
+    task_set,
+    class_name,
+    episodes,
+    rollout_steps,
+    trials_per_class,
+    agent_mode,
+    obs_normalizer,
+    device,
+    seed,
+    deterministic,
+    squash_actions,
+    action_scale,
+    clip_actions,
+):
+    """Run all trials for one task class in one vectorized batch.
+
+    Batch dimension B = trials_per_class. Each env is a separate task
+    variation/sample from the same task class.
+    """
+    envs = make_vector_env_for_class(
+        classes=classes,
+        tasks=tasks,
+        task_set=task_set,
+        class_name=class_name,
+        num_envs=trials_per_class,
+        seed=seed,
+    )
+
+    raw_obs, _ = envs.reset()
+    raw_obs = np.asarray(raw_obs, dtype=np.float32)
+    if hasattr(obs_normalizer, "update"):
+        obs_normalizer.update(raw_obs)
+    obs = obs_normalizer.normalize(raw_obs)
+
+    B = trials_per_class
+    action_dim = envs.single_action_space.shape[0]
+    low = envs.single_action_space.low
+    high = envs.single_action_space.high
+
+    episode_memory = model.init_episode_memory(B, device=device, num_episodes=episodes)
+    prev_action = np.zeros((B, action_dim), dtype=np.float32)
+    prev_reward = np.zeros((B, 1), dtype=np.float32)
+    prev_done = np.zeros((B, 1), dtype=np.float32)
+
+    ttt_embeddings = []
+    context_embeddings = []
+    rows = []
+
+    for ep in range(episodes):
+        cache_params = None
+        ep_return = np.zeros(B, dtype=np.float32)
+        ep_success = np.zeros(B, dtype=bool)
+        steps_taken = np.zeros(B, dtype=np.int32)
+        out = None
+        final_context = None
+
+        for step in range(rollout_steps):
+            agent_input = get_agent_input(obs, prev_action, prev_reward, prev_done, agent_mode)
+            inp_t = torch.tensor(agent_input, dtype=torch.float32, device=device)
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+
+            out = model.act_step(inp_t, obs_t, episode_memory, ep, cache_params)
+            final_context = model.aggregate_step(episode_memory, out.hidden_states, ep)
+
+            mean, log_std = out.policy
+            if deterministic:
+                raw_action = mean
+            else:
+                dist = torch.distributions.Normal(mean, log_std.exp())
+                raw_action = dist.sample()
+
+            if squash_actions:
+                env_action_t = action_scale * torch.tanh(raw_action)
+            else:
+                env_action_t = raw_action
+
+            env_action = env_action_t.detach().cpu().numpy().astype(np.float32)
+            if clip_actions:
+                env_action = np.clip(env_action, low, high).astype(np.float32)
+
+            next_raw_obs, reward, terminated, truncated, info = envs.step(env_action)
+            done = np.logical_or(terminated, truncated)
+
+            ep_return += reward.astype(np.float32)
+            ep_success = np.logical_or(ep_success, get_success_array(info, B))
+            steps_taken[~done] = step + 1
+            steps_taken[done] = np.maximum(steps_taken[done], step + 1)
+
+            cache_params = out.cache_params
+            prev_action = env_action
+            prev_reward = reward[:, None].astype(np.float32)
+            prev_done = done[:, None].astype(np.float32)
+
+            next_raw_obs = np.asarray(next_raw_obs, dtype=np.float32)
+            if hasattr(obs_normalizer, "update"):
+                obs_normalizer.update(next_raw_obs)
+            obs = obs_normalizer.normalize(next_raw_obs)
+
+            if done.all():
+                break
+
+        if out is None or final_context is None:
+            envs.close()
+            raise RuntimeError("Episode produced no rollout steps.")
+
+        ttt_h = out.hidden_states.detach().cpu().numpy().astype(np.float32)
+        ctx_h = final_context.detach().cpu().numpy().astype(np.float32)
+
+        ttt_embeddings.append(ttt_h)
+        context_embeddings.append(ctx_h)
+        episode_memory[:, ep, :] = out.hidden_states.detach()
+
+        for trial_idx in range(B):
+            rows.append(
+                {
+                    "class_name": class_name,
+                    "episode": ep + 1,
+                    "episode_return": float(ep_return[trial_idx]),
+                    "episode_success": int(ep_success[trial_idx]),
+                    "steps": int(max(1, steps_taken[trial_idx])),
+                    "trial": trial_idx,
+                    "seed": seed + trial_idx,
+                }
+            )
+
+        if ep < episodes - 1:
+            raw_obs, _ = envs.reset()
+            raw_obs = np.asarray(raw_obs, dtype=np.float32)
+            if hasattr(obs_normalizer, "update"):
+                obs_normalizer.update(raw_obs)
+            obs = obs_normalizer.normalize(raw_obs)
+            prev_action[:] = 0.0
+            prev_reward[:] = 0.0
+            prev_done[:] = 0.0
+
+    envs.close()
+
+    # Row order is episode-major then trial-minor, matching rows above.
+    X_ttt = np.concatenate(ttt_embeddings, axis=0)
+    X_ctx = np.concatenate(context_embeddings, axis=0)
+    return X_ttt, X_ctx, rows
+
+
 @torch.no_grad()
 def rollout_one_class(
     model,
@@ -375,10 +548,47 @@ def collect_embeddings(args, cfg_args, model, meta_learning, obs_normalizer, dev
             specs.append(("test", name, meta_learning.test_classes, meta_learning.test_tasks))
 
     for split, class_name, classes, tasks in specs:
-        for trial in range(args.trials_per_class):
-            seed = args.seed + 100000 * (split == "test") + 1000 * trial + len(all_rows)
-            print(f"Collecting split={split:<5s} class={class_name:<28s} trial={trial + 1}/{args.trials_per_class}")
-            ttt, ctx, rows = rollout_one_class(
+        seed = args.seed + 100000 * (split == "test") + 1000 * len(all_rows)
+
+        if getattr(args, "serial_collection", False):
+            # Old slow path: one env/trial at a time.
+            for trial in range(args.trials_per_class):
+                trial_seed = seed + trial
+                print(
+                    f"Collecting SERIAL split={split:<5s} class={class_name:<28s} "
+                    f"trial={trial + 1}/{args.trials_per_class}"
+                )
+                ttt, ctx, rows = rollout_one_class(
+                    model=model,
+                    classes=classes,
+                    tasks=tasks,
+                    task_set=cfg_args.task_set,
+                    class_name=class_name,
+                    episodes=args.episodes,
+                    rollout_steps=args.rollout_steps or cfg_args.rollout_steps,
+                    agent_mode=cfg_args.agent_mode,
+                    obs_normalizer=obs_normalizer,
+                    device=device,
+                    seed=trial_seed,
+                    deterministic=not args.stochastic,
+                    squash_actions=cfg_args.squash_actions or args.force_squash_actions,
+                    action_scale=args.action_scale if args.action_scale is not None else cfg_args.action_scale,
+                    clip_actions=args.clip_actions,
+                )
+                for r in rows:
+                    r["split"] = split
+                    r["trial"] = trial
+                    r["seed"] = trial_seed
+                    all_rows.append(r)
+                all_ttt.append(ttt)
+                all_ctx.append(ctx)
+        else:
+            # Fast path: vectorize all trials for this class.
+            print(
+                f"Collecting VECTORIZED split={split:<5s} class={class_name:<28s} "
+                f"trials={args.trials_per_class}"
+            )
+            ttt, ctx, rows = rollout_class_vectorized(
                 model=model,
                 classes=classes,
                 tasks=tasks,
@@ -386,6 +596,7 @@ def collect_embeddings(args, cfg_args, model, meta_learning, obs_normalizer, dev
                 class_name=class_name,
                 episodes=args.episodes,
                 rollout_steps=args.rollout_steps or cfg_args.rollout_steps,
+                trials_per_class=args.trials_per_class,
                 agent_mode=cfg_args.agent_mode,
                 obs_normalizer=obs_normalizer,
                 device=device,
@@ -395,13 +606,9 @@ def collect_embeddings(args, cfg_args, model, meta_learning, obs_normalizer, dev
                 action_scale=args.action_scale if args.action_scale is not None else cfg_args.action_scale,
                 clip_actions=args.clip_actions,
             )
-
             for r in rows:
                 r["split"] = split
-                r["trial"] = trial
-                r["seed"] = seed
                 all_rows.append(r)
-
             all_ttt.append(ttt)
             all_ctx.append(ctx)
 
@@ -867,6 +1074,7 @@ def main():
 
     parser.add_argument("--episodes", type=int, default=None, help="Episodes per trial. Default: config trial_length.")
     parser.add_argument("--trials_per_class", type=int, default=10)
+    parser.add_argument("--serial_collection", action="store_true", help="Use the old one-trial-at-a-time collection path.")
     parser.add_argument("--rollout_steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=123)
 
